@@ -1,0 +1,66 @@
+version: 2
+
+project_name: hostler
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/serhiitroinin/hostler/cmd.version={{.Version}}
+    binary: hostler
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+brews:
+  - name: hostler
+    repository:
+      owner: serhiitroinin
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/serhiitroinin/hostler"
+    description: "CLI tool to manage local development domains with nginx"
+    license: "MIT"
+    install: |
+      bin.install "hostler"
+    test: |
+      system "#{bin}/hostler", "--version"
+    caveats: |
+      hostler requires nginx to be installed:
+        brew install nginx
+
+      Most commands require sudo:
+        sudo hostler add myapp.loc 3000
