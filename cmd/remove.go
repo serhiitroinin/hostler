@@ -3,13 +3,16 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
-	"github.com/serhiitroinin/hostler/internal/hosts"
+	"github.com/serhiitroinin/hostler/internal/config"
 	"github.com/serhiitroinin/hostler/internal/nginx"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
+
+// Note: getExecutablePath is defined in add.go
 
 var removeCmd = &cobra.Command{
 	Use:     "remove <domain>",
@@ -26,11 +29,15 @@ Example:
 func runRemove(cmd *cobra.Command, args []string) {
 	domain := args[0]
 
-	// Check root privileges
-	if os.Geteuid() != 0 {
-		color.Red("Error: This command requires root privileges. Please run with sudo.")
+	// Check if hostler has been initialized
+	if !config.IsInitialized() {
+		color.Red("Error: hostler not initialized.")
+		fmt.Println()
+		fmt.Println("Run 'sudo hostler init' to set up hostler for passwordless operation.")
 		os.Exit(1)
 	}
+
+	userConfigDir := config.GetCurrentUserConfigDir()
 
 	fmt.Println()
 	color.Cyan("Detecting nginx configuration...")
@@ -42,10 +49,10 @@ func runRemove(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Read existing entries
-	entries, err := nginx.ParseManagedConfig(cfg.ManagedConfPath)
+	// Read existing entries from user config directory
+	entries, err := nginx.ParseUserConfigs(userConfigDir)
 	if err != nil {
-		color.Red("Error: Failed to parse config: %v", err)
+		color.Red("Error: Failed to parse configs: %v", err)
 		os.Exit(1)
 	}
 
@@ -61,34 +68,40 @@ func runRemove(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	color.Cyan("Removing configuration...")
 
-	// Remove from entries
-	entries = nginx.RemoveEntry(entries, domain)
-
-	// Write updated config
-	if err := nginx.WriteManagedConfig(cfg.ManagedConfPath, entries); err != nil {
-		color.Red("Error: Failed to write nginx config: %v", err)
+	// Remove nginx config file (no sudo needed - user-writable directory)
+	if err := nginx.RemoveUserDomainConfig(userConfigDir, domain); err != nil {
+		color.Red("Error: Failed to remove nginx config: %v", err)
 		os.Exit(1)
 	}
-	color.Green("  Updated nginx config")
+	color.Green("  Removed %s/%s.conf", userConfigDir, domain)
 
-	// Remove from hosts file
-	if err := hosts.RemoveEntry(hosts.GetHostsPath(), domain); err != nil {
+	// Remove from hosts file via sudo (passwordless via sudoers)
+	hostlerPath := getExecutablePath()
+	hostsCmd := exec.Command("sudo", hostlerPath, "_hosts-remove", domain)
+	if output, err := hostsCmd.CombinedOutput(); err != nil {
 		color.Red("Error: Failed to update hosts file: %v", err)
+		if len(output) > 0 {
+			fmt.Println(string(output))
+		}
 		os.Exit(1)
 	}
-	color.Green("  Updated /etc/hosts")
+	color.Green("  Updated /etc/hosts (via sudo)")
 
-	// Test nginx config
-	if err := nginx.TestConfig(); err != nil {
-		color.Red("Error: %v", err)
+	// Test nginx config via sudo
+	testCmd := exec.Command("sudo", "nginx", "-t")
+	if output, err := testCmd.CombinedOutput(); err != nil {
+		color.Red("Error: nginx config test failed")
+		fmt.Println(string(output))
 		os.Exit(1)
 	}
 	color.Green("  nginx config is valid")
 
-	// Reload nginx if running
+	// Reload nginx if running via sudo
 	if cfg.IsRunning {
-		if err := nginx.Reload(); err != nil {
-			color.Red("Error: %v", err)
+		reloadCmd := exec.Command("sudo", "nginx", "-s", "reload")
+		if output, err := reloadCmd.CombinedOutput(); err != nil {
+			color.Red("Error: Failed to reload nginx")
+			fmt.Println(string(output))
 			os.Exit(1)
 		}
 		color.Green("  nginx reloaded")

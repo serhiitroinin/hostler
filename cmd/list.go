@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/serhiitroinin/hostler/internal/config"
 	"github.com/serhiitroinin/hostler/internal/nginx"
 
 	"github.com/fatih/color"
@@ -24,17 +25,21 @@ var listCmd = &cobra.Command{
 func runList(cmd *cobra.Command, args []string) {
 	fmt.Println()
 
-	// Detect nginx
-	cfg, err := nginx.Detect()
-	if err != nil {
-		color.Red("Error: %v", err)
-		os.Exit(1)
+	// Check if hostler has been initialized
+	if !config.IsInitialized() {
+		color.Yellow("hostler not initialized.")
+		fmt.Println()
+		fmt.Println("Run 'sudo hostler init' to set up hostler.")
+		fmt.Println()
+		return
 	}
 
-	// Read entries
-	entries, err := nginx.ParseManagedConfig(cfg.ManagedConfPath)
+	userConfigDir := config.GetCurrentUserConfigDir()
+
+	// Read entries from user config directory
+	entries, err := nginx.ParseUserConfigs(userConfigDir)
 	if err != nil {
-		color.Red("Error: Failed to parse config: %v", err)
+		color.Red("Error: Failed to parse configs: %v", err)
 		os.Exit(1)
 	}
 
@@ -42,7 +47,7 @@ func runList(cmd *cobra.Command, args []string) {
 		color.Yellow("No domains configured yet.")
 		fmt.Println()
 		fmt.Println("Add a domain with:")
-		fmt.Println("  sudo hostler add myapp.loc 3000")
+		fmt.Println("  hostler add myapp.loc 3000")
 		fmt.Println()
 		return
 	}
@@ -87,7 +92,7 @@ func runList(cmd *cobra.Command, args []string) {
 
 	table.Render()
 	fmt.Printf("\n  Total: %d domain(s)\n", len(entries))
-	fmt.Printf("  Config: %s\n\n", cfg.ManagedConfPath)
+	fmt.Printf("  Config: %s\n\n", userConfigDir)
 }
 
 func checkPortStatus(port int) string {

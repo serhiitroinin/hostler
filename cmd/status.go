@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/serhiitroinin/hostler/internal/config"
 	"github.com/serhiitroinin/hostler/internal/nginx"
 
 	"github.com/fatih/color"
@@ -41,24 +42,44 @@ func runStatus(cmd *cobra.Command, args []string) {
 	fmt.Printf("nginx version:  %s\n", cfg.Version)
 	fmt.Printf("nginx config:   %s\n", cfg.MainConfigPath)
 	fmt.Printf("include dir:    %s\n", cfg.IncludeDir)
-	fmt.Printf("managed config: %s\n", cfg.ManagedConfPath)
 
-	// Check if managed config exists
-	if _, err := os.Stat(cfg.ManagedConfPath); err == nil {
-		color.Green("managed file:   exists")
-	} else {
-		color.Yellow("managed file:   not created yet")
-	}
+	fmt.Println()
 
-	// Count domains
-	entries, err := nginx.ParseManagedConfig(cfg.ManagedConfPath)
-	if err != nil {
-		fmt.Printf("domains:        error reading config\n")
+	// hostler status
+	if config.IsInitialized() {
+		color.Green("hostler mode:   initialized")
+		userConfigDir := config.GetCurrentUserConfigDir()
+		fmt.Printf("user config:    %s\n", userConfigDir)
+
+		// Check if sudoers file exists
+		if _, err := os.Stat("/etc/sudoers.d/hostler"); err == nil {
+			color.Green("sudoers:        configured")
+		} else {
+			color.Yellow("sudoers:        not found")
+		}
+
+		// Check if include directive exists
+		if nginx.HasIncludeDirective(cfg.MainConfigPath, userConfigDir) {
+			color.Green("nginx include:  configured")
+		} else {
+			color.Yellow("nginx include:  not found")
+		}
+
+		// Count domains
+		entries, err := nginx.ParseUserConfigs(userConfigDir)
+		if err != nil {
+			fmt.Printf("domains:        error reading configs\n")
+		} else {
+			fmt.Printf("domains:        %d\n", len(entries))
+		}
 	} else {
-		fmt.Printf("domains:        %d\n", len(entries))
+		color.Yellow("hostler mode:   not initialized")
+		fmt.Println()
+		fmt.Println("Run 'sudo hostler init' to set up hostler for passwordless operation.")
 	}
 
 	// Test config
+	fmt.Println()
 	if err := nginx.TestConfig(); err != nil {
 		color.Red("config valid:   no")
 	} else {

@@ -34,4 +34,9 @@ func init() {
 	rootCmd.AddCommand(removeCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(initCmd)
+
+	// Hidden internal commands (for sudoers)
+	rootCmd.AddCommand(hostsAddCmd)
+	rootCmd.AddCommand(hostsRemoveCmd)
 }

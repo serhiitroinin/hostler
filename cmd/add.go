@@ -3,14 +3,30 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 
+	"github.com/serhiitroinin/hostler/internal/config"
 	"github.com/serhiitroinin/hostler/internal/hosts"
 	"github.com/serhiitroinin/hostler/internal/nginx"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
+
+// getExecutablePath returns the absolute path to the current executable
+func getExecutablePath() string {
+	execPath, err := os.Executable()
+	if err != nil {
+		return "hostler"
+	}
+	// Resolve symlinks to get the real path
+	if realPath, err := filepath.EvalSymlinks(execPath); err == nil {
+		return realPath
+	}
+	return execPath
+}
 
 var addCmd = &cobra.Command{
 	Use:   "add <domain> <port>",
@@ -32,11 +48,15 @@ func runAdd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Check root privileges
-	if os.Geteuid() != 0 {
-		color.Red("Error: This command requires root privileges. Please run with sudo.")
+	// Check if hostler has been initialized
+	if !config.IsInitialized() {
+		color.Red("Error: hostler not initialized.")
+		fmt.Println()
+		fmt.Println("Run 'sudo hostler init' to set up hostler for passwordless operation.")
 		os.Exit(1)
 	}
+
+	userConfigDir := config.GetCurrentUserConfigDir()
 
 	fmt.Println()
 	color.Cyan("Detecting nginx configuration...")
@@ -49,7 +69,7 @@ func runAdd(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Printf("  nginx version: %s\n", cfg.Version)
-	fmt.Printf("  config dir: %s\n", cfg.IncludeDir)
+	fmt.Printf("  config dir: %s\n", userConfigDir)
 
 	// Check if nginx is running
 	if !cfg.IsRunning {
@@ -71,14 +91,14 @@ func runAdd(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	color.Cyan("Checking for conflicts...")
 
-	// Read existing entries
-	entries, err := nginx.ParseManagedConfig(cfg.ManagedConfPath)
+	// Read existing entries from user config directory
+	entries, err := nginx.ParseUserConfigs(userConfigDir)
 	if err != nil {
-		color.Red("Error: Failed to parse config: %v", err)
+		color.Red("Error: Failed to parse configs: %v", err)
 		os.Exit(1)
 	}
 
-	// Check for conflicts in our managed config
+	// Check for conflicts in our managed configs
 	for _, entry := range entries {
 		if entry.Domain == domain {
 			color.Red("Error: Domain '%s' already exists (port %d)", domain, entry.Port)
@@ -92,7 +112,7 @@ func runAdd(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Check for conflicts in other nginx configs
+	// Check for conflicts in system nginx configs
 	domainConflict, portConflict, err := nginx.FindConflicts(cfg.IncludeDir, domain, port, true)
 	if err != nil {
 		color.Yellow("Warning: Could not check for conflicts: %v", err)
@@ -119,37 +139,46 @@ func runAdd(cmd *cobra.Command, args []string) {
 	fmt.Println()
 	color.Cyan("Updating configuration...")
 
-	// Add to hosts file
-	if err := hosts.AddEntry(hosts.GetHostsPath(), domain); err != nil {
-		color.Red("Error: Failed to update hosts file: %v", err)
-		os.Exit(1)
-	}
-	color.Green("  Updated /etc/hosts")
-
-	// Add to nginx config
-	entries = append(entries, nginx.DomainEntry{Domain: domain, Port: port})
-	if err := nginx.WriteManagedConfig(cfg.ManagedConfPath, entries); err != nil {
+	// Write nginx config to user directory (no sudo needed)
+	if err := nginx.WriteUserDomainConfig(userConfigDir, domain, port); err != nil {
 		color.Red("Error: Failed to write nginx config: %v", err)
 		os.Exit(1)
 	}
-	color.Green("  Updated nginx config")
+	color.Green("  Created %s/%s.conf", userConfigDir, domain)
 
-	// Test nginx config
-	if err := nginx.TestConfig(); err != nil {
-		color.Red("Error: %v", err)
+	// Add to hosts file via sudo (passwordless via sudoers)
+	hostlerPath := getExecutablePath()
+	hostsCmd := exec.Command("sudo", hostlerPath, "_hosts-add", domain)
+	if output, err := hostsCmd.CombinedOutput(); err != nil {
+		color.Red("Error: Failed to update hosts file: %v", err)
+		if len(output) > 0 {
+			fmt.Println(string(output))
+		}
+		// Rollback: remove the config file we just created
+		nginx.RemoveUserDomainConfig(userConfigDir, domain)
+		os.Exit(1)
+	}
+	color.Green("  Updated /etc/hosts (via sudo)")
+
+	// Test nginx config via sudo
+	testCmd := exec.Command("sudo", "nginx", "-t")
+	if output, err := testCmd.CombinedOutput(); err != nil {
+		color.Red("Error: nginx config test failed")
+		fmt.Println(string(output))
 		color.Yellow("  Rolling back changes...")
-		// Rollback: remove the entry we just added
-		entries = entries[:len(entries)-1]
-		nginx.WriteManagedConfig(cfg.ManagedConfPath, entries)
-		hosts.RemoveEntry(hosts.GetHostsPath(), domain)
+		// Rollback: remove config and hosts entry
+		nginx.RemoveUserDomainConfig(userConfigDir, domain)
+		exec.Command("sudo", hostlerPath, "_hosts-remove", domain).Run()
 		os.Exit(1)
 	}
 	color.Green("  nginx config is valid")
 
-	// Reload nginx
+	// Reload nginx via sudo
 	if cfg.IsRunning {
-		if err := nginx.Reload(); err != nil {
-			color.Red("Error: %v", err)
+		reloadCmd := exec.Command("sudo", "nginx", "-s", "reload")
+		if output, err := reloadCmd.CombinedOutput(); err != nil {
+			color.Red("Error: Failed to reload nginx")
+			fmt.Println(string(output))
 			os.Exit(1)
 		}
 		color.Green("  nginx reloaded")

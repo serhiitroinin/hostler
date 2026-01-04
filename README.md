@@ -4,9 +4,10 @@ A CLI tool to manage local development domains with nginx. Automatically handles
 
 ## Features
 
+- **One-time setup** - Run `sudo hostler init` once, then use without sudo
 - **Auto-detects nginx** - Finds config path, include directory, and checks if running
 - **Conflict detection** - Prevents duplicate domains and port conflicts
-- **Managed config** - Maintains a single config file, doesn't touch other nginx configs
+- **Per-domain configs** - Each domain gets its own config file in `~/.hostler/nginx/`
 - **Table output** - Lists domains with status (up/down)
 - **Auto-reload** - Tests and reloads nginx configuration automatically
 
@@ -31,28 +32,86 @@ sudo mv hostler /usr/local/bin/
 ### Prerequisites
 
 - nginx installed and configured
-- Root/sudo access (for `/etc/hosts` and nginx config)
+- Root/sudo access (only for initial setup)
+
+## Quick Start
+
+### 1. Initialize (one-time setup)
+
+```bash
+sudo hostler init
+```
+
+This sets up hostler for passwordless operation by:
+- Creating `~/.hostler/nginx/` for your domain configs
+- Adding an include directive to nginx.conf
+- Configuring sudoers for specific operations
+
+### 2. Add domains (no sudo needed!)
+
+```bash
+hostler add myapp.loc 3000
+hostler add api.loc 8080
+```
+
+### 3. List and manage
+
+```bash
+hostler list              # Show all domains
+hostler remove myapp.loc  # Remove a domain
+hostler status            # Check system status
+```
 
 ## Usage
+
+### Initialize hostler
+
+```bash
+sudo hostler init
+```
+
+Output:
+
+```
+hostler init
+─────────────────────────────────────
+Detecting nginx...
+  nginx version: 1.25.3
+  nginx config: /opt/homebrew/etc/nginx/nginx.conf
+
+Creating user configuration directory...
+  Created: /Users/you/.hostler/nginx/
+
+Adding include directive to nginx.conf...
+  Added: include /Users/you/.hostler/nginx/*.conf;
+
+Testing nginx configuration...
+  nginx config is valid
+
+Setting up passwordless sudo...
+  Created: /etc/sudoers.d/hostler
+
+Successfully initialized hostler!
+```
 
 ### Add a domain
 
 ```bash
-sudo hostler add myapp.loc 3000
+hostler add myapp.loc 3000
 ```
 
 This will:
 
 1. Check if nginx is running
 2. Validate no conflicts exist
-3. Add `127.0.0.1 myapp.loc` to `/etc/hosts`
-4. Create nginx reverse proxy config
+3. Create `~/.hostler/nginx/myapp.loc.conf`
+4. Add `127.0.0.1 myapp.loc` to `/etc/hosts`
 5. Test and reload nginx
 
 ### Remove a domain
 
 ```bash
-sudo hostler remove myapp.loc
+hostler remove myapp.loc
 ```
 
 ### List all domains
@@ -72,7 +131,7 @@ Output:
 +-------------+------+-------------------+--------+
 
   Total: 2 domain(s)
-  Config: /opt/homebrew/etc/nginx/servers/hostler-managed.conf
+  Config: /Users/you/.hostler/nginx
 ```
 
 ### Check status
@@ -90,20 +149,31 @@ nginx:          running
 nginx version:  1.25.3
 nginx config:   /opt/homebrew/etc/nginx/nginx.conf
 include dir:    /opt/homebrew/etc/nginx/servers
-managed config: /opt/homebrew/etc/nginx/servers/hostler-managed.conf
-managed file:   exists
+
+hostler mode:   initialized
+user config:    /Users/you/.hostler/nginx
+sudoers:        configured
+nginx include:  configured
 domains:        2
+
 config valid:   yes
 ```
 
 ## Configuration
 
-hostler creates a single managed config file in your nginx include directory:
+### User config directory
 
-- **macOS (Apple Silicon)**: `/opt/homebrew/etc/nginx/servers/hostler-managed.conf`
-- **macOS (Intel)**: `/usr/local/etc/nginx/servers/hostler-managed.conf`
-- **Linux (Debian/Ubuntu)**: `/etc/nginx/sites-enabled/hostler-managed.conf`
-- **Linux (CentOS/RHEL)**: `/etc/nginx/conf.d/hostler-managed.conf`
+After initialization, hostler stores domain configs in your home directory:
+
+```
+~/.hostler/
+└── nginx/
+    ├── .initialized
+    ├── myapp.loc.conf
+    └── api.loc.conf
+```
+
+Each domain gets its own nginx config file, making it easy to inspect and debug.
 
 ### Hosts file
 
@@ -116,17 +186,13 @@ Entries are added to `/etc/hosts` in a managed block:
 # END hostler managed block
 ```
 
-## nginx Setup
+### Sudoers configuration
 
-Make sure your nginx.conf includes the appropriate directory. For Homebrew on macOS:
+The `init` command creates `/etc/sudoers.d/hostler` with rules that allow:
+- Adding/removing entries from `/etc/hosts`
+- Running `nginx -t` and `nginx -s reload`
 
-```nginx
-http {
-    # ... other config ...
-
-    include servers/*;  # This should already be there
-}
-```
+This is scoped to your user only and uses the minimum required privileges.
 
 ## Development
 
@@ -138,10 +204,13 @@ cd hostler
 # Build
 go build -o hostler .
 
+# Initialize (one-time)
+sudo ./hostler init
+
 # Test locally
-sudo ./hostler add test.loc 4000
+./hostler add test.loc 4000
 ./hostler list
-sudo ./hostler remove test.loc
+./hostler remove test.loc
 ```
 
 ## Releasing

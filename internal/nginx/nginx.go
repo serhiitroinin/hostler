@@ -335,3 +335,128 @@ func FindEntry(entries []DomainEntry, domain string) *DomainEntry {
 	}
 	return nil
 }
+
+// AddIncludeDirective adds an include directive to nginx.conf for the user config directory
+// Returns true if the directive was added, false if it already exists
+func AddIncludeDirective(configPath, userConfigDir string) (bool, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read nginx.conf: %w", err)
+	}
+
+	content := string(data)
+	includePattern := fmt.Sprintf("include %s/*.conf;", userConfigDir)
+
+	// Check if include already exists
+	if strings.Contains(content, includePattern) {
+		return false, nil
+	}
+
+	// Find the http block and add include directive
+	// Look for the last closing brace of the http block
+	httpBlockRe := regexp.MustCompile(`(?s)(http\s*\{.*?)(\n\s*\})(\s*$)`)
+	if !httpBlockRe.MatchString(content) {
+		return false, fmt.Errorf("could not find http block in nginx.conf")
+	}
+
+	// Add the include directive before the closing brace of http block
+	newContent := httpBlockRe.ReplaceAllString(content,
+		fmt.Sprintf("$1\n    # Hostler user configs\n    include %s/*.conf;$2$3", userConfigDir))
+
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		return false, fmt.Errorf("failed to write nginx.conf: %w", err)
+	}
+
+	return true, nil
+}
+
+// RemoveIncludeDirective removes the include directive from nginx.conf
+func RemoveIncludeDirective(configPath, userConfigDir string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read nginx.conf: %w", err)
+	}
+
+	content := string(data)
+
+	// Remove the include line and the comment above it
+	includePattern := fmt.Sprintf(`\n\s*# Hostler user configs\n\s*include %s/\*\.conf;`, regexp.QuoteMeta(userConfigDir))
+	re := regexp.MustCompile(includePattern)
+	newContent := re.ReplaceAllString(content, "")
+
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write nginx.conf: %w", err)
+	}
+
+	return nil
+}
+
+// WriteUserDomainConfig writes a single domain config to the user's config directory
+func WriteUserDomainConfig(configDir, domain string, port int) error {
+	configPath := filepath.Join(configDir, domain+".conf")
+	content := fmt.Sprintf(`# Managed by hostler - %s
+server {
+    listen 80;
+    server_name %s;
+
+    location / {
+        proxy_pass http://127.0.0.1:%d;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+`, domain, domain, port)
+
+	return os.WriteFile(configPath, []byte(content), 0644)
+}
+
+// RemoveUserDomainConfig removes a single domain config from the user's config directory
+func RemoveUserDomainConfig(configDir, domain string) error {
+	configPath := filepath.Join(configDir, domain+".conf")
+	if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove config: %w", err)
+	}
+	return nil
+}
+
+// ParseUserConfigs reads all domain configs from the user's config directory
+func ParseUserConfigs(configDir string) ([]DomainEntry, error) {
+	var entries []DomainEntry
+
+	files, err := filepath.Glob(filepath.Join(configDir, "*.conf"))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		// Skip hidden files and init marker
+		basename := filepath.Base(file)
+		if strings.HasPrefix(basename, ".") {
+			continue
+		}
+
+		fileEntries, err := ParseManagedConfig(file)
+		if err != nil {
+			continue // Skip files that can't be parsed
+		}
+		entries = append(entries, fileEntries...)
+	}
+
+	return entries, nil
+}
+
+// HasIncludeDirective checks if the user config directory is already included in nginx.conf
+func HasIncludeDirective(configPath, userConfigDir string) bool {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	includePattern := fmt.Sprintf("include %s/*.conf;", userConfigDir)
+	return strings.Contains(string(data), includePattern)
+}
