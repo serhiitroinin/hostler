@@ -1,21 +1,13 @@
-# Binary
+# Compiled binary
 hostler
+dist/
 
-# Go
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Dependencies
+node_modules/
 
-# Test binary
-*.test
-
-# Output of go coverage
-*.out
-
-# Go workspace
-go.work
+# Bun
+.bun/
+bun.lockb
 
 # IDE
 .idea/
@@ -26,9 +18,3 @@ go.work
 # OS
 .DS_Store
 Thumbs.db
-
-# GoReleaser
-dist/
-
-# Reference files
-_reference/
