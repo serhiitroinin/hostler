@@ -2,11 +2,15 @@
 // the minimum privileged work: editing /etc/hosts. Strict domain validation
 // guards against argument injection through the sudoers rule.
 import { addEntry, getHostsPath, removeEntry } from "../lib/hosts.ts";
-import { isValidDomain } from "../lib/domain.ts";
+import { isValidDomain, normalizeDomain } from "../lib/domain.ts";
 import { printError } from "../lib/ui.ts";
 
-function guard(domain: string | undefined): string {
-  if (!domain || !isValidDomain(domain)) {
+function guard(raw: string | undefined): string {
+  // Normalize here too: these helpers are reachable directly through the
+  // sudoers wildcard, so an uppercase domain shouldn't slip past the lowercase
+  // canonicalization that `add`/`remove` apply.
+  const domain = normalizeDomain(raw ?? "");
+  if (!isValidDomain(domain)) {
     printError("Invalid domain format");
     process.exit(1);
   }

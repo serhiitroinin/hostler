@@ -1,6 +1,6 @@
 // `hostler status` — report nginx + hostler configuration health.
-import { existsSync } from "node:fs";
 import { isInitialized, getCurrentUserConfigDir } from "../lib/config.ts";
+import { run, selfInvocation } from "../lib/exec.ts";
 import * as nginx from "../lib/nginx.ts";
 import { green, red, rule, yellow } from "../lib/ui.ts";
 
@@ -30,10 +30,11 @@ export async function status(): Promise<void> {
     const configDir = getCurrentUserConfigDir();
     console.log(`user config:    ${configDir}`);
 
+    const sudoers = await checkSudoers();
     console.log(
-      existsSync("/etc/sudoers.d/hostler")
+      sudoers === "ok"
         ? green("sudoers:        configured")
-        : yellow("sudoers:        not found"),
+        : yellow(`sudoers:        ${sudoers} (run 'sudo hostler init')`),
     );
 
     console.log(
@@ -69,4 +70,18 @@ export async function status(): Promise<void> {
     console.log(yellow("                duplicate. Check for stale files in the system nginx include dir."));
   }
   console.log();
+}
+
+/**
+ * Verifies the *effective* sudoers policy rather than just that the file
+ * exists. The file is mode 0440 root-owned, so an unprivileged `status` can't
+ * read it. Instead we attempt the privileged `_nginx-add` with no arguments
+ * under `sudo -n`: if the rule covers the current binary path, hostler runs and
+ * rejects the empty domain ("Invalid domain format"); if no passwordless rule
+ * matches (missing or stale, e.g. pointing at an old binary path), sudo refuses
+ * and hostler never runs.
+ */
+async function checkSudoers(): Promise<"ok" | "not configured or stale"> {
+  const res = await run(["sudo", "-n", ...selfInvocation(), "_nginx-add"]);
+  return res.combined.includes("Invalid domain format") ? "ok" : "not configured or stale";
 }
