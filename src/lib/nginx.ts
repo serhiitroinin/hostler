@@ -2,8 +2,9 @@
 // process control.
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { run, which } from "./exec.ts";
+import { writeFileAtomicSync } from "./fsatomic.ts";
 
 export interface NginxConfig {
   mainConfigPath: string;
@@ -26,7 +27,7 @@ export async function detect(): Promise<NginxConfig> {
   const isRunning = await isNginxRunning();
   const { version, configPath } = await getNginxInfo();
   if (!configPath) throw new Error("could not determine nginx config path");
-  const includeDir = await findIncludeDir(configPath);
+  const includeDir = findIncludeDir(configPath);
   return { mainConfigPath: configPath, includeDir, isRunning, version };
 }
 
@@ -80,7 +81,13 @@ function findConfigFile(): string {
   return candidates.find((p) => existsSync(p)) ?? "";
 }
 
-async function findIncludeDir(configPath: string): Promise<string> {
+/**
+ * Resolves nginx's include directory WITHOUT creating it — detection must be
+ * free of filesystem side effects so read-only commands like `status` can't
+ * mutate the system or fail on permissions. Returns the platform-appropriate
+ * default path when none exists yet; `init` is responsible for creating it.
+ */
+function findIncludeDir(configPath: string): string {
   const configDir = dirname(configPath);
   const candidates = [
     join(configDir, "servers"), // macOS Homebrew
@@ -90,11 +97,12 @@ async function findIncludeDir(configPath: string): Promise<string> {
   for (const dir of candidates) {
     if (existsSync(dir)) return dir;
   }
+  return process.platform === "darwin" ? join(configDir, "servers") : join(configDir, "conf.d");
+}
 
-  // Nothing exists yet — create the platform-appropriate default.
-  const fallback = process.platform === "darwin" ? join(configDir, "servers") : join(configDir, "conf.d");
-  await mkdir(fallback, { recursive: true });
-  return fallback;
+/** Creates the include directory if it doesn't exist. Called only by `init`. */
+export async function ensureIncludeDir(includeDir: string): Promise<void> {
+  await mkdir(includeDir, { recursive: true });
 }
 
 // --- Process control -------------------------------------------------------
@@ -162,12 +170,28 @@ export async function writeUserDomainConfig(
   domain: string,
   port: number,
 ): Promise<void> {
-  await writeFile(join(configDir, `${domain}.conf`), generateServerBlock(domain, port));
+  const target = domainConfigPath(configDir, domain);
+  writeFileAtomicSync(target, generateServerBlock(domain, port));
 }
 
 /** Removes a single domain's config from the user config dir (no-op if absent). */
 export async function removeUserDomainConfig(configDir: string, domain: string): Promise<void> {
-  await rm(join(configDir, `${domain}.conf`), { force: true });
+  const target = domainConfigPath(configDir, domain);
+  await rm(target, { force: true });
+}
+
+/**
+ * Builds the config path for a domain and asserts it stays inside `configDir`.
+ * The domain is validated upstream, but this is defense in depth against any
+ * path-traversal sneaking through (e.g. a crafted server_name).
+ */
+function domainConfigPath(configDir: string, domain: string): string {
+  const target = resolve(configDir, `${domain}.conf`);
+  const base = resolve(configDir);
+  if (target !== join(base, `${domain}.conf`) || !target.startsWith(base + sep)) {
+    throw new Error(`refusing to operate on path outside config dir: ${target}`);
+  }
+  return target;
 }
 
 // --- Config parsing --------------------------------------------------------
@@ -276,18 +300,63 @@ export async function addIncludeDirective(configPath: string, userConfigDir: str
   const includeLine = `include ${userConfigDir}/*.conf;`;
   if (content.includes(includeLine)) return false;
 
-  // Insert before the closing brace of the http block.
-  const httpBlockRe = /(http\s*\{[\s\S]*?)(\n\s*\})(\s*)$/;
-  if (!httpBlockRe.test(content)) {
+  const inserted = insertIntoHttpBlock(content, `    # Hostler user configs\n    ${includeLine}\n`);
+  if (inserted === null) {
     throw new Error("could not find http block in nginx.conf");
   }
-
-  const newContent = content.replace(
-    httpBlockRe,
-    `$1\n    # Hostler user configs\n    ${includeLine}$2$3`,
-  );
-  await writeFile(configPath, newContent);
+  await writeFile(configPath, inserted);
   return true;
+}
+
+/**
+ * Inserts `snippet` just before the closing brace of the top-level `http { }`
+ * block, located by brace counting rather than a regex. This is robust to
+ * trailing top-level blocks (`stream {}`, `events {}`) and comments after the
+ * http block, which the old `...}$ ` regex mishandled. Returns null if no http
+ * block is found. Braces inside `#` comments and quoted strings are ignored.
+ */
+export function insertIntoHttpBlock(content: string, snippet: string): string | null {
+  const httpMatch = content.match(/(^|\n)\s*http\s*\{/);
+  if (httpMatch?.index === undefined) return null;
+
+  // Index of the opening brace of the http block.
+  const openIdx = content.indexOf("{", httpMatch.index);
+  if (openIdx === -1) return null;
+
+  let depth = 0;
+  let inComment = false;
+  let quote: string | null = null;
+
+  for (let i = openIdx; i < content.length; i++) {
+    const ch = content[i]!;
+
+    if (inComment) {
+      if (ch === "\n") inComment = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote && content[i - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (ch === "#") {
+      inComment = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        // `i` is the http block's closing brace — insert just before it.
+        const indentedSnippet = snippet.endsWith("\n") ? snippet : `${snippet}\n`;
+        return content.slice(0, i) + indentedSnippet + content.slice(i);
+      }
+    }
+  }
+  return null; // unbalanced — no matching close brace
 }
 
 /** Removes the include directive (and its comment) added by addIncludeDirective. */

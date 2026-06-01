@@ -1,6 +1,7 @@
 // Manages /etc/hosts entries inside a delimited block so hostler never touches
 // lines it doesn't own.
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { withLock, writeFileAtomicSync } from "./fsatomic.ts";
 
 const BEGIN_MARKER = "# BEGIN hostler managed block";
 const END_MARKER = "# END hostler managed block";
@@ -52,16 +53,21 @@ export async function getManagedDomains(hostsPath: string): Promise<string[]> {
 
 /** Adds a domain to the managed block (no-op if already present). */
 export async function addEntry(hostsPath: string, domain: string): Promise<void> {
-  const entries = await getManagedDomains(hostsPath);
-  if (entries.includes(domain)) return;
-  entries.push(domain);
-  await writeManagedBlock(hostsPath, entries);
+  // Lock the whole read-modify-write so concurrent invocations can't clobber.
+  await withLock("hosts", async () => {
+    const entries = await getManagedDomains(hostsPath);
+    if (entries.includes(domain)) return;
+    entries.push(domain);
+    await writeManagedBlock(hostsPath, entries);
+  });
 }
 
 /** Removes a domain from the managed block. */
 export async function removeEntry(hostsPath: string, domain: string): Promise<void> {
-  const entries = (await getManagedDomains(hostsPath)).filter((d) => d !== domain);
-  await writeManagedBlock(hostsPath, entries);
+  await withLock("hosts", async () => {
+    const entries = (await getManagedDomains(hostsPath)).filter((d) => d !== domain);
+    await writeManagedBlock(hostsPath, entries);
+  });
 }
 
 // Rewrites the hosts file, stripping any existing managed block and appending a
@@ -92,5 +98,5 @@ async function writeManagedBlock(hostsPath: string, entries: string[]): Promise<
     result = `${result}\n`;
   }
 
-  await writeFile(hostsPath, result);
+  writeFileAtomicSync(hostsPath, result);
 }
