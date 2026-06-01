@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,17 +17,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          go-version: '1.21'
+          bun-version: latest
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck and test
+        run: |
+          bun run typecheck
+          bun test
+
+      - name: Build cross-platform binaries
+        run: bun run build:all
+
+      - name: Package archives
+        working-directory: dist
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for bin in hostler-*; do
+            target="${bin#hostler-}"            # e.g. darwin-arm64
+            os="${target%-*}"
+            arch="${target#*-}"
+            stage="hostler_${version}_${os}_${arch}"
+            mkdir -p "$stage"
+            cp "$bin" "$stage/hostler"
+            cp ../README.md ../LICENSE "$stage/" 2>/dev/null || true
+            tar -czf "${stage}.tar.gz" -C "$stage" .
+            rm -rf "$stage"
+          done
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
