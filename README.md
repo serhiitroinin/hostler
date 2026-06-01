@@ -168,17 +168,22 @@ config valid:   yes
 
 ### User config directory
 
-After initialization, hostler stores domain configs in your home directory:
+After initialization, hostler stores domain configs under your home directory:
 
 ```
-~/.hostler/
-└── nginx/
+~/.hostler/          (owned by you)
+└── nginx/           (owned by root)
     ├── .initialized
     ├── myapp.loc.conf
     └── api.loc.conf
 ```
 
 Each domain gets its own nginx config file, making it easy to inspect and debug.
+The `nginx/` directory is **root-owned**: because it's included into the
+root-run nginx and reloadable without a password, letting any process write
+arbitrary `.conf` files there would be a privilege-escalation risk. Instead,
+`add`/`remove` write configs through small privileged helpers (`_nginx-add` /
+`_nginx-remove`) that re-validate the domain and port.
 
 ### Hosts file
 
@@ -194,10 +199,18 @@ Entries are added to `/etc/hosts` in a managed block:
 ### Sudoers configuration
 
 The `init` command creates `/etc/sudoers.d/hostler` with rules that allow:
-- Adding/removing entries from `/etc/hosts`
+- Adding/removing entries from `/etc/hosts` (`_hosts-add` / `_hosts-remove`)
+- Writing per-domain nginx configs (`_nginx-add` / `_nginx-remove`)
 - Running `nginx -t` and `nginx -s reload`
 
-This is scoped to your user only and uses the minimum required privileges.
+This is scoped to your user only and uses the minimum required privileges. Each
+privileged helper re-validates its arguments, so the wildcard sudoers rules
+can't be abused for arbitrary commands. `init` must be run from the compiled
+binary (not `bun run`), so the sudoers rule references a stable path.
+
+> **Upgrading from an older install?** Re-run `sudo ./hostler init` once. It
+> migrates the config directory to root ownership and installs the updated
+> sudoers rules.
 
 ## Development
 
