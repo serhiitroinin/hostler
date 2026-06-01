@@ -56,7 +56,7 @@ async function main(): Promise<void> {
       return;
 
     case "init":
-      await init();
+      await init(args);
       return;
     case "add":
       await add(args);

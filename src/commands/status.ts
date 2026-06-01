@@ -75,13 +75,20 @@ export async function status(): Promise<void> {
 /**
  * Verifies the *effective* sudoers policy rather than just that the file
  * exists. The file is mode 0440 root-owned, so an unprivileged `status` can't
- * read it. Instead we attempt the privileged `_nginx-add` with no arguments
- * under `sudo -n`: if the rule covers the current binary path, hostler runs and
+ * read it. Instead we attempt each privileged helper with no arguments under
+ * `sudo -n`: if the rule covers the current binary path, hostler runs and
  * rejects the empty domain ("Invalid domain format"); if no passwordless rule
  * matches (missing or stale, e.g. pointing at an old binary path), sudo refuses
- * and hostler never runs.
+ * and hostler never runs. All four helper rules are checked so a partially
+ * stale file doesn't read as fully configured. (The `nginx -t` rule is verified
+ * separately via testConfigSudo; `nginx -s reload` isn't probed because that
+ * would actually reload nginx.)
  */
 async function checkSudoers(): Promise<"ok" | "not configured or stale"> {
-  const res = await run(["sudo", "-n", ...selfInvocation(), "_nginx-add"]);
-  return res.combined.includes("Invalid domain format") ? "ok" : "not configured or stale";
+  const helpers = ["_hosts-add", "_hosts-remove", "_nginx-add", "_nginx-remove"];
+  for (const cmd of helpers) {
+    const res = await run(["sudo", "-n", ...selfInvocation(), cmd]);
+    if (!res.combined.includes("Invalid domain format")) return "not configured or stale";
+  }
+  return "ok";
 }

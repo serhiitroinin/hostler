@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { insertIntoHttpBlock } from "../src/lib/nginx.ts";
-import { buildSudoers } from "../src/commands/init.ts";
+import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
 
 describe("insertIntoHttpBlock", () => {
   test("inserts before the http block's closing brace, not the file end", () => {
@@ -55,5 +55,17 @@ describe("buildSudoers", () => {
   test("does not grant a blanket nginx or shell rule", () => {
     expect(sudoers).not.toMatch(/NOPASSWD:\s*\/opt\/homebrew\/bin\/nginx\s*$/m);
     expect(sudoers).not.toContain("ALL\n");
+  });
+});
+
+describe("sudoersPathFor", () => {
+  test("is per-user and dot-free (sudo ignores dotted filenames)", () => {
+    expect(sudoersPathFor("alice")).toBe("/etc/sudoers.d/hostler-alice");
+    expect(sudoersPathFor("first.last")).toBe("/etc/sudoers.d/hostler-first_last");
+    expect(sudoersPathFor("a b")).toBe("/etc/sudoers.d/hostler-a_b");
+  });
+
+  test("distinct users get distinct files (no clobber)", () => {
+    expect(sudoersPathFor("alice")).not.toBe(sudoersPathFor("bob"));
   });
 });
