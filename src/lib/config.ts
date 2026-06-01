@@ -18,6 +18,17 @@ export function getCurrentUserConfigDir(): string {
   return getUserConfigDir(homedir());
 }
 
+/**
+ * Returns the config dir of the user who invoked the process, even under sudo.
+ * Running as root, homedir() points at /var/root or /root, so the privileged
+ * `_nginx-*` helpers must resolve the *invoking* user's ~/.hostler/nginx via
+ * SUDO_USER. Falls back to the current user when not running under sudo.
+ */
+export function getInvokingUserConfigDir(): string {
+  const realUser = getRealUser();
+  return realUser ? getUserConfigDir(realUser.home) : getCurrentUserConfigDir();
+}
+
 /** Returns the top-level ~/.hostler directory for a given home dir. */
 export function getHostlerDir(home: string): string {
   return join(home, HOSTLER_DIR);

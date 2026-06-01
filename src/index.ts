@@ -8,6 +8,7 @@ import { list } from "./commands/list.ts";
 import { status } from "./commands/status.ts";
 import { init } from "./commands/init.ts";
 import { hostsAdd, hostsRemove } from "./commands/hosts-internal.ts";
+import { nginxAdd, nginxRemove } from "./commands/nginx-internal.ts";
 import { bold, cyan, dim, printError } from "./lib/ui.ts";
 
 const VERSION = pkg.version;
@@ -79,6 +80,12 @@ async function main(): Promise<void> {
       return;
     case "_hosts-remove":
       await hostsRemove(args);
+      return;
+    case "_nginx-add":
+      await nginxAdd(args);
+      return;
+    case "_nginx-remove":
+      await nginxRemove(args);
       return;
 
     default:

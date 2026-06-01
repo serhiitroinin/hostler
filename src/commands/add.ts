@@ -1,34 +1,32 @@
 // `hostler add <domain> <port>` — create or update a domain → port mapping.
 //
 // Re-adding an existing domain with a new port performs an atomic UPDATE rather
-// than erroring: the config is rewritten, validated, and reloaded, with a
-// rollback to the previous config if `nginx -t` fails. This removes the old
-// remove-then-re-add dance that could leave a domain "mounted" on a stale port.
-import { readFile } from "node:fs/promises";
+// than erroring. nginx config writes go through the privileged `_nginx-add`
+// helper (the config dir is root-owned), and every failure path — hosts update,
+// `nginx -t`, and reload — rolls the change back to the prior state.
 import { isInitialized, getCurrentUserConfigDir } from "../lib/config.ts";
-import { isValidDomain } from "../lib/domain.ts";
-import { run, selfPath } from "../lib/exec.ts";
+import { isValidDomain, normalizeDomain, parsePort } from "../lib/domain.ts";
+import { run, selfInvocation } from "../lib/exec.ts";
 import * as hosts from "../lib/hosts.ts";
 import * as nginx from "../lib/nginx.ts";
 import { confirm, green, printError, printInfo, printOk, printWarn } from "../lib/ui.ts";
 
 export async function add(args: string[]): Promise<void> {
-  const domain = args[0];
-  const portStr = args[1];
-
-  if (!domain || !portStr) {
+  if (!args[0] || !args[1]) {
     printError("Usage: hostler add <domain> <port>");
     process.exit(1);
   }
 
-  const port = Number.parseInt(portStr, 10);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    printError(`Invalid port number: ${portStr}`);
+  const domain = normalizeDomain(args[0]);
+  const port = parsePort(args[1]);
+
+  if (port === null) {
+    printError(`Invalid port number: ${args[1]}`);
+    printWarn("  Port must be an integer between 1 and 65535");
     process.exit(1);
   }
-
   if (!isValidDomain(domain)) {
-    printError(`Invalid domain format: ${domain}`);
+    printError(`Invalid domain format: ${args[0]}`);
     printWarn("  Domains must look like 'myapp.loc' (letters, numbers, hyphens, at least one dot)");
     process.exit(1);
   }
@@ -40,7 +38,7 @@ export async function add(args: string[]): Promise<void> {
   }
 
   const configDir = getCurrentUserConfigDir();
-  const configPath = `${configDir}/${domain}.conf`;
+  const sudoSelf = (...a: string[]) => run(["sudo", ...selfInvocation(), ...a]);
 
   console.log();
   printInfo("Detecting nginx configuration...");
@@ -78,7 +76,6 @@ export async function add(args: string[]): Promise<void> {
   const entries = await nginx.parseUserConfigs(configDir);
   const existing = nginx.findEntry(entries, domain);
 
-  // Idempotent no-op: same domain, same port.
   if (existing && existing.port === port) {
     printOk(`  ${domain} is already mapped to localhost:${port} — nothing to do`);
     console.log();
@@ -87,14 +84,11 @@ export async function add(args: string[]): Promise<void> {
 
   const isUpdate = existing !== undefined;
 
-  // A different hostler domain already targets this port. Unusual but valid in
-  // nginx, so warn instead of refusing (the old version hard-failed here).
   const portTwin = entries.find((e) => e.domain !== domain && e.port === port);
   if (portTwin) {
     printWarn(`Warning: port ${port} is also used by '${portTwin.domain}'`);
   }
 
-  // Conflicts in the SYSTEM nginx include dir (configs not managed by hostler).
   try {
     const { domainConflict, portConflict } = await nginx.findConflicts(cfg.includeDir, domain, port);
     if (domainConflict) {
@@ -120,38 +114,38 @@ export async function add(args: string[]): Promise<void> {
   console.log();
   printInfo("Updating configuration...");
 
-  // Capture the previous config so we can restore it if validation fails.
-  const previousContent = isUpdate ? await readFile(configPath, "utf8").catch(() => null) : null;
-
-  await nginx.writeUserDomainConfig(configDir, domain, port);
-  if (isUpdate) {
-    printOk(`  Updated ${configPath} (port ${existing!.port ?? "?"} → ${port})`);
-  } else {
-    printOk(`  Created ${configPath}`);
-  }
-
-  // Helper that restores the working tree to its pre-`add` state.
+  // Restores the prior state. On update, rewrite the previous port (when known);
+  // otherwise tear down the new config and hosts entry.
   const rollback = async () => {
-    if (isUpdate && previousContent !== null) {
-      await Bun.write(configPath, previousContent);
+    if (isUpdate && existing!.port !== null) {
+      await sudoSelf("_nginx-add", domain, String(existing!.port));
     } else {
-      await nginx.removeUserDomainConfig(configDir, domain);
-      await run(["sudo", selfPath(), "_hosts-remove", domain]);
+      await sudoSelf("_nginx-remove", domain);
+      if (!isUpdate) await sudoSelf("_hosts-remove", domain);
     }
   };
 
-  // Add the hosts entry via sudo (idempotent; already present on update).
-  const hostsRes = await run(["sudo", selfPath(), "_hosts-add", domain]);
+  // 1. Write the nginx config as root via the privileged helper.
+  const writeRes = await sudoSelf("_nginx-add", domain, String(port));
+  if (!writeRes.ok) {
+    printError("Failed to write nginx config");
+    if (writeRes.combined.trim()) console.log(writeRes.combined.trim());
+    process.exit(1);
+  }
+  if (isUpdate) printOk(`  Updated ${configDir}/${domain}.conf (port ${existing!.port ?? "?"} → ${port})`);
+  else printOk(`  Created ${configDir}/${domain}.conf`);
+
+  // 2. Add the hosts entry (idempotent; already present on update).
+  const hostsRes = await sudoSelf("_hosts-add", domain);
   if (!hostsRes.ok) {
     printError("Failed to update hosts file");
     if (hostsRes.combined.trim()) console.log(hostsRes.combined.trim());
-    if (isUpdate && previousContent !== null) await Bun.write(configPath, previousContent);
-    else await nginx.removeUserDomainConfig(configDir, domain);
+    await rollback();
     process.exit(1);
   }
   if (!isUpdate) printOk("  Updated /etc/hosts (via sudo)");
 
-  // Validate via sudo nginx -t.
+  // 3. Validate.
   const nginxBin = await nginx.resolveNginxBin();
   const test = await run(["sudo", nginxBin, "-t"]);
   if (!test.ok) {
@@ -163,12 +157,15 @@ export async function add(args: string[]): Promise<void> {
   }
   printOk("  nginx config is valid");
 
-  // Reload if nginx is running.
+  // 4. Reload — and roll back the running config if the reload fails.
   if (cfg.isRunning) {
     const reload = await run(["sudo", nginxBin, "-s", "reload"]);
     if (!reload.ok) {
       printError("Failed to reload nginx");
       console.log(reload.combined.trim());
+      printWarn("  Rolling back changes...");
+      await rollback();
+      await run(["sudo", nginxBin, "-s", "reload"]); // best-effort revert of running state
       process.exit(1);
     }
     printOk("  nginx reloaded");
