@@ -202,7 +202,8 @@ Entries are added to `/etc/hosts` in a managed block:
 
 ### Sudoers configuration
 
-The `init` command creates `/etc/sudoers.d/hostler` with rules that allow:
+The `init` command creates a **per-user** file `/etc/sudoers.d/hostler-<user>`
+(so multiple users on one machine don't clobber each other) with rules that allow:
 - Adding/removing entries from `/etc/hosts` (`_hosts-add` / `_hosts-remove`)
 - Writing per-domain nginx configs (`_nginx-add` / `_nginx-remove`)
 - Running `nginx -t` and `nginx -s reload`
@@ -212,13 +213,24 @@ privileged helper re-validates its arguments, so the wildcard sudoers rules
 can't be abused for arbitrary commands. `init` must be run from the compiled
 binary (not `bun run`), so the sudoers rule references a stable path.
 
+**`init` fails closed on untrusted binaries.** Because a NOPASSWD rule pointing
+at a binary you can overwrite is equivalent to passwordless root, `init` aborts
+if the `hostler` or `nginx` binary isn't root-owned and non-writable by others.
+Install them to a root-owned path first:
+
+```bash
+sudo install -o root -m 0755 ./hostler /usr/local/bin/hostler
+```
+
+On Homebrew (whose prefix is user-owned) you can accept the risk explicitly with
+`sudo hostler init --allow-untrusted-binaries`.
+
 > **Upgrading from an older install?** Re-run `sudo hostler init` once. It moves
 > the config directory to `/etc/hostler/<user>/` (root-owned), migrates your
-> existing domains there by regenerating them from hostler's template, and
-> installs the updated sudoers rules. For the strongest guarantee, install the
-> `hostler` binary to a root-owned path (e.g. `/usr/local/bin`) before running
-> init — otherwise it warns that the sudoers rule references a user-writable
-> binary.
+> existing domains by regenerating them from hostler's template, **removes the
+> old `~/.hostler/nginx` include and directory** (so nginx no longer includes a
+> user-writable path), and installs the per-user sudoers rules (retiring the old
+> shared `/etc/sudoers.d/hostler`).
 
 ## Development
 
