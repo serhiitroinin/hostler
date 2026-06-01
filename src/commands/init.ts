@@ -1,6 +1,6 @@
 // `sudo hostler init` — one-time privileged setup that enables passwordless
 // daily use: create the root-owned config dir under /etc, add the nginx
-// include, and install a minimal sudoers rule.
+// include, and install a minimal per-user sudoers rule.
 import { existsSync } from "node:fs";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,9 +14,19 @@ import { isCompiled, run, selfPath } from "../lib/exec.ts";
 import * as nginx from "../lib/nginx.ts";
 import { printError, printInfo, printOk, printWarn, rule } from "../lib/ui.ts";
 
-const SUDOERS_PATH = "/etc/sudoers.d/hostler";
+const LEGACY_SUDOERS_PATH = "/etc/sudoers.d/hostler";
+const ALLOW_UNTRUSTED_FLAG = "--allow-untrusted-binaries";
 
-export async function init(): Promise<void> {
+// sudo ignores files in sudoers.d whose names contain a dot, so the per-user
+// filename must be sanitized (usernames may legitimately contain dots).
+export function sudoersPathFor(username: string): string {
+  const safe = username.replace(/[^A-Za-z0-9_-]/g, "_");
+  return `/etc/sudoers.d/hostler-${safe}`;
+}
+
+export async function init(args: string[] = []): Promise<void> {
+  const allowUntrusted = args.includes(ALLOW_UNTRUSTED_FLAG);
+
   if (!(process.getuid && process.getuid() === 0)) {
     printError("This command requires root privileges. Please run with sudo.");
     process.exit(1);
@@ -55,6 +65,10 @@ export async function init(): Promise<void> {
   console.log(`  nginx version: ${cfg.version}`);
   console.log(`  nginx config: ${cfg.mainConfigPath}`);
 
+  // Fail closed early if a binary we'd reference from a NOPASSWD rule isn't
+  // safe, before changing any system state.
+  await assertTrustedBinaries(await nginx.resolveNginxBin(), allowUntrusted);
+
   // Make sure nginx's include dir exists (detect() no longer creates it).
   try {
     await nginx.ensureIncludeDir(cfg.includeDir);
@@ -76,10 +90,10 @@ export async function init(): Promise<void> {
   }
   printOk(`  Created: ${configDir} (root-owned)`);
 
-  // Step 2b: migrate domains from a previous-version dir (~/.hostler/nginx).
-  // Only the validated domain + port are carried over and regenerated from
-  // hostler's own template — pre-existing file contents are never copied.
-  await migrateOldConfigs(username, configDir);
+  // Step 2b: migrate from a previous-version dir (~/.hostler/nginx) and, crucially,
+  // remove its include + the old user-writable directory so the upgrade doesn't
+  // keep including an unsafe path.
+  await migrateOldInstall(username, configDir, cfg.mainConfigPath);
 
   // Step 3: add the include directive to nginx.conf.
   console.log();
@@ -107,18 +121,19 @@ export async function init(): Promise<void> {
   }
   printOk("  nginx config is valid");
 
-  // Step 5: install the sudoers rule.
+  // Step 5: install the per-user sudoers rule.
   console.log();
   printInfo("Setting up passwordless sudo...");
+  const sudoersPath = sudoersPathFor(username);
   try {
-    await createSudoersFile(username);
+    await createSudoersFile(username, sudoersPath);
   } catch (err) {
     printError(err instanceof Error ? err.message : String(err));
     printWarn("  Rolling back changes...");
     await nginx.removeIncludeDirective(cfg.mainConfigPath, configDir);
     process.exit(1);
   }
-  printOk(`  Created: ${SUDOERS_PATH}`);
+  printOk(`  Created: ${sudoersPath}`);
 
   // Step 6: mark initialization complete (root-owned, like the rest of the dir).
   try {
@@ -135,8 +150,44 @@ export async function init(): Promise<void> {
   console.log("  hostler list\n");
 }
 
-/** Regenerates domain configs from a previous-version ~/.hostler/nginx dir. */
-async function migrateOldConfigs(username: string, configDir: string): Promise<void> {
+/**
+ * Aborts init when the hostler or nginx binary isn't safe to reference from a
+ * NOPASSWD sudoers rule (not root-owned, or writable by group/others) — that
+ * would be equivalent to handing the writer passwordless root. Pass
+ * --allow-untrusted-binaries to override (e.g. Homebrew, whose prefix is
+ * user-owned and the user accepts the risk).
+ */
+async function assertTrustedBinaries(nginxPath: string, allowUntrusted: boolean): Promise<void> {
+  const problems: string[] = [];
+  for (const [label, path] of [
+    ["hostler", selfPath()],
+    ["nginx", nginxPath],
+  ] as const) {
+    const reason = nginx.untrustedBinaryReason(path);
+    if (reason) problems.push(`${label} binary ${path} is ${reason}`);
+  }
+  if (problems.length === 0) return;
+
+  if (!allowUntrusted) {
+    printError("refusing to grant passwordless root to a non-root-owned binary:");
+    for (const p of problems) console.log(`  - ${p}`);
+    console.log("\nAnyone who can modify that binary could run it as root via the sudoers rule.");
+    console.log("Fix it by installing hostler/nginx to a root-owned path, e.g.:");
+    console.log("  sudo install -o root -m 0755 ./hostler /usr/local/bin/hostler");
+    console.log(`\nOr, to proceed anyway and accept the risk, re-run with ${ALLOW_UNTRUSTED_FLAG}.`);
+    process.exit(1);
+  }
+
+  printWarn("  Proceeding with untrusted binaries (--allow-untrusted-binaries):");
+  for (const p of problems) printWarn(`    - ${p}`);
+}
+
+/**
+ * Regenerates domains from a previous-version ~/.hostler/nginx dir, then removes
+ * that dir's include from nginx.conf and deletes the dir. Without the include
+ * removal an upgraded install would keep including a user-writable directory.
+ */
+async function migrateOldInstall(username: string, configDir: string, mainConfigPath: string): Promise<void> {
   const home = await resolveUserHome(username);
   if (!home) return;
   const oldDir = join(home, ".hostler", "nginx");
@@ -150,38 +201,35 @@ async function migrateOldConfigs(username: string, configDir: string): Promise<v
       migrated++;
     }
   }
+
+  // Neutralize the old include (the security-critical part) and remove the dir.
+  await nginx.removeIncludeDirective(mainConfigPath, oldDir);
+  await rm(join(home, ".hostler"), { recursive: true, force: true });
+
   if (migrated > 0) printOk(`  Migrated ${migrated} domain(s) from ${oldDir}`);
+  printOk(`  Removed legacy include and ${oldDir}`);
 }
 
-async function createSudoersFile(username: string): Promise<void> {
+async function createSudoersFile(username: string, sudoersPath: string): Promise<void> {
   const hostlerPath = selfPath();
   const nginxPath = await nginx.resolveNginxBin();
-
-  // Referencing a non-root-owned binary from a NOPASSWD rule means whoever can
-  // write that binary can run it as root. On Homebrew macOS the prefix is
-  // user-owned, so warn rather than hard-fail (it would block normal installs).
-  for (const [label, path] of [
-    ["hostler", hostlerPath],
-    ["nginx", nginxPath],
-  ] as const) {
-    const reason = nginx.untrustedBinaryReason(path);
-    if (reason) {
-      printWarn(`  Warning: ${label} binary ${path} is ${reason}.`);
-      printWarn("           Anyone who can modify it could run it as root via this rule.");
-      printWarn("           Install hostler/nginx to a root-owned path for best security.");
-    }
-  }
-
   const content = buildSudoers(username, hostlerPath, nginxPath);
 
   // sudoers files must be mode 0440.
-  await writeFile(SUDOERS_PATH, content, { mode: 0o440 });
+  await writeFile(sudoersPath, content, { mode: 0o440 });
 
   // Validate syntax; remove the file if visudo rejects it.
-  const check = await run(["visudo", "-c", "-f", SUDOERS_PATH]);
+  const check = await run(["visudo", "-c", "-f", sudoersPath]);
   if (!check.ok) {
-    await rm(SUDOERS_PATH, { force: true });
+    await rm(sudoersPath, { force: true });
     throw new Error(`invalid sudoers syntax: ${check.combined}`);
+  }
+
+  // Retire the old single-user shared file so it can't leave a dangling rule
+  // pointing at a previous binary path.
+  if (existsSync(LEGACY_SUDOERS_PATH)) {
+    await rm(LEGACY_SUDOERS_PATH, { force: true });
+    printWarn(`  Removed legacy shared sudoers file ${LEGACY_SUDOERS_PATH}`);
   }
 }
 
