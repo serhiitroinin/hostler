@@ -73,7 +73,14 @@ export async function remove(args: string[]): Promise<void> {
     printError("Failed to update hosts file");
     if (hostsRes.combined.trim()) console.log(hostsRes.combined.trim());
     printWarn("  Rolling back changes...");
-    await sudoSelf("_nginx-add", domain, String(found.port ?? ""));
+    // The hosts entry wasn't removed (the call failed), so only the nginx config
+    // needs restoring — and only if we know the port it had. A malformed config
+    // with no parseable port can't be faithfully regenerated.
+    if (found.port !== null) {
+      await sudoSelf("_nginx-add", domain, String(found.port));
+    } else {
+      printWarn(`  Could not restore '${domain}': original config had no valid port`);
+    }
     process.exit(1);
   }
   printOk("  Updated /etc/hosts (via sudo)");
