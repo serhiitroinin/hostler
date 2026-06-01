@@ -1,10 +1,15 @@
 // `sudo hostler init` — one-time privileged setup that enables passwordless
-// daily use: create the (root-owned) config dir, add the nginx include, and
-// install a minimal sudoers rule.
-import { chownSync, readdirSync } from "node:fs";
+// daily use: create the root-owned config dir under /etc, add the nginx
+// include, and install a minimal sudoers rule.
+import { existsSync } from "node:fs";
 import { writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { getRealUser, getUserConfigDir, writeInitMarker } from "../lib/config.ts";
+import { join } from "node:path";
+import {
+  getUserConfigDir,
+  resolveUserHome,
+  writeInitMarker,
+} from "../lib/config.ts";
+import { isValidDomain, normalizeDomain } from "../lib/domain.ts";
 import { isCompiled, run, selfPath } from "../lib/exec.ts";
 import * as nginx from "../lib/nginx.ts";
 import { printError, printInfo, printOk, printWarn, rule } from "../lib/ui.ts";
@@ -28,9 +33,9 @@ export async function init(): Promise<void> {
     process.exit(1);
   }
 
-  const realUser = getRealUser();
-  if (!realUser) {
-    printError("Could not determine user. Make sure to run with sudo, not as root directly.");
+  const username = process.env.SUDO_USER;
+  if (!username) {
+    printError("Could not determine user. Run via sudo (sudo hostler init), not as root directly.");
     process.exit(1);
   }
 
@@ -57,32 +62,36 @@ export async function init(): Promise<void> {
     printWarn(`  Could not ensure include dir ${cfg.includeDir}: ${err instanceof Error ? err.message : err}`);
   }
 
-  // Step 2: create the config directory. It is ROOT-owned so unprivileged
-  // processes cannot drop arbitrary .conf files for root nginx to load; writes
-  // go through the privileged _nginx-add / _nginx-remove helpers. The parent
-  // ~/.hostler is owned by the user so they can read it.
+  // Step 2: create the config directory under /etc — root-owned with no
+  // user-writable parent, so an unprivileged process cannot swap it out and
+  // feed arbitrary configs to root nginx. Writes go through the _nginx-* helpers.
   console.log();
   printInfo("Creating configuration directory...");
-  const userConfigDir = getUserConfigDir(realUser.home);
+  const configDir = getUserConfigDir(username);
   try {
-    await createConfigDir(userConfigDir, realUser.uid, realUser.gid);
+    await mkdir(configDir, { recursive: true, mode: 0o755 });
   } catch (err) {
     printError(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
-  printOk(`  Created: ${userConfigDir} (root-owned)`);
+  printOk(`  Created: ${configDir} (root-owned)`);
+
+  // Step 2b: migrate domains from a previous-version dir (~/.hostler/nginx).
+  // Only the validated domain + port are carried over and regenerated from
+  // hostler's own template — pre-existing file contents are never copied.
+  await migrateOldConfigs(username, configDir);
 
   // Step 3: add the include directive to nginx.conf.
   console.log();
   printInfo("Adding include directive to nginx.conf...");
   let includeAdded = false;
   try {
-    includeAdded = await nginx.addIncludeDirective(cfg.mainConfigPath, userConfigDir);
+    includeAdded = await nginx.addIncludeDirective(cfg.mainConfigPath, configDir);
   } catch (err) {
     printError(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
-  if (includeAdded) printOk(`  Added: include ${userConfigDir}/*.conf;`);
+  if (includeAdded) printOk(`  Added: include ${configDir}/*.conf;`);
   else printWarn("  Include directive already exists");
 
   // Step 4: validate nginx config, rolling back the include on failure.
@@ -93,7 +102,7 @@ export async function init(): Promise<void> {
   } catch (err) {
     printError(err instanceof Error ? err.message : String(err));
     printWarn("  Rolling back changes...");
-    await nginx.removeIncludeDirective(cfg.mainConfigPath, userConfigDir);
+    await nginx.removeIncludeDirective(cfg.mainConfigPath, configDir);
     process.exit(1);
   }
   printOk("  nginx config is valid");
@@ -102,18 +111,18 @@ export async function init(): Promise<void> {
   console.log();
   printInfo("Setting up passwordless sudo...");
   try {
-    await createSudoersFile(realUser.name);
+    await createSudoersFile(username);
   } catch (err) {
     printError(err instanceof Error ? err.message : String(err));
     printWarn("  Rolling back changes...");
-    await nginx.removeIncludeDirective(cfg.mainConfigPath, userConfigDir);
+    await nginx.removeIncludeDirective(cfg.mainConfigPath, configDir);
     process.exit(1);
   }
   printOk(`  Created: ${SUDOERS_PATH}`);
 
   // Step 6: mark initialization complete (root-owned, like the rest of the dir).
   try {
-    await writeInitMarker(userConfigDir);
+    await writeInitMarker(configDir);
   } catch (err) {
     printWarn(`Warning: Could not write init marker: ${err instanceof Error ? err.message : err}`);
   }
@@ -126,25 +135,44 @@ export async function init(): Promise<void> {
   console.log("  hostler list\n");
 }
 
-/**
- * Creates the config dir owned by root, with the parent ~/.hostler owned by the
- * user. Any pre-existing contents (from an older user-owned install) are also
- * chowned to root so they can't be tampered with after the fact.
- */
-async function createConfigDir(configDir: string, uid: number, gid: number): Promise<void> {
-  const parent = dirname(configDir);
-  await mkdir(configDir, { recursive: true });
+/** Regenerates domain configs from a previous-version ~/.hostler/nginx dir. */
+async function migrateOldConfigs(username: string, configDir: string): Promise<void> {
+  const home = await resolveUserHome(username);
+  if (!home) return;
+  const oldDir = join(home, ".hostler", "nginx");
+  if (!existsSync(oldDir)) return;
 
-  if (uid >= 0 && gid >= 0) chownSync(parent, uid, gid); // ~/.hostler → user
-  chownSync(configDir, 0, 0); // ~/.hostler/nginx → root
-
-  for (const name of readdirSync(configDir)) {
-    chownSync(join(configDir, name), 0, 0);
+  let migrated = 0;
+  for (const entry of await nginx.parseUserConfigs(oldDir)) {
+    const domain = normalizeDomain(entry.domain);
+    if (entry.port !== null && isValidDomain(domain)) {
+      await nginx.writeUserDomainConfig(configDir, domain, entry.port);
+      migrated++;
+    }
   }
+  if (migrated > 0) printOk(`  Migrated ${migrated} domain(s) from ${oldDir}`);
 }
 
 async function createSudoersFile(username: string): Promise<void> {
-  const content = buildSudoers(username, selfPath(), await nginx.resolveNginxBin());
+  const hostlerPath = selfPath();
+  const nginxPath = await nginx.resolveNginxBin();
+
+  // Referencing a non-root-owned binary from a NOPASSWD rule means whoever can
+  // write that binary can run it as root. On Homebrew macOS the prefix is
+  // user-owned, so warn rather than hard-fail (it would block normal installs).
+  for (const [label, path] of [
+    ["hostler", hostlerPath],
+    ["nginx", nginxPath],
+  ] as const) {
+    const reason = nginx.untrustedBinaryReason(path);
+    if (reason) {
+      printWarn(`  Warning: ${label} binary ${path} is ${reason}.`);
+      printWarn("           Anyone who can modify it could run it as root via this rule.");
+      printWarn("           Install hostler/nginx to a root-owned path for best security.");
+    }
+  }
+
+  const content = buildSudoers(username, hostlerPath, nginxPath);
 
   // sudoers files must be mode 0440.
   await writeFile(SUDOERS_PATH, content, { mode: 0o440 });

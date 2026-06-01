@@ -1,9 +1,9 @@
 // nginx detection, config generation/parsing, include-directive management, and
 // process control.
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { run, which } from "./exec.ts";
+import { run } from "./exec.ts";
 import { writeFileAtomicSync } from "./fsatomic.ts";
 
 export interface NginxConfig {
@@ -38,8 +38,10 @@ async function isNginxRunning(): Promise<boolean> {
 }
 
 async function getNginxInfo(): Promise<{ version: string; configPath: string }> {
-  // `nginx -V` prints version + build flags to stderr.
-  const res = await run(["nginx", "-V"]);
+  // `nginx -V` prints version + build flags to stderr. Use the trusted absolute
+  // path rather than relying on $PATH.
+  const bin = await resolveNginxBin();
+  const res = await run([bin, "-V"]);
   const output = res.combined;
 
   let version = "";
@@ -57,18 +59,57 @@ async function getNginxInfo(): Promise<{ version: string; configPath: string }> 
   return { version, configPath };
 }
 
+// Known nginx install locations, by platform. We deliberately do NOT consult
+// $PATH / `which`: `init` runs under sudo, and an attacker-controlled PATH could
+// otherwise make us execute or grant sudoers access to a planted binary.
+const NGINX_CANDIDATES: Record<string, string[]> = {
+  darwin: [
+    "/opt/homebrew/bin/nginx",
+    "/opt/homebrew/sbin/nginx",
+    "/usr/local/bin/nginx",
+    "/usr/local/sbin/nginx",
+    "/usr/sbin/nginx",
+  ],
+  default: [
+    "/usr/sbin/nginx",
+    "/usr/bin/nginx",
+    "/usr/local/sbin/nginx",
+    "/usr/local/bin/nginx",
+    "/usr/local/nginx/sbin/nginx",
+  ],
+};
+
 /**
- * Resolves the absolute path to the nginx binary. Used for both the sudoers
- * rule and the privileged `sudo nginx ...` calls so they match exactly.
+ * Resolves the absolute path to the nginx binary from a trusted allowlist of
+ * standard install locations. Throws if none exist, rather than falling back to
+ * a bare `nginx` that depends on $PATH.
  */
 export async function resolveNginxBin(): Promise<string> {
-  const found = await which("nginx");
-  if (found) return found;
-  const fallbacks =
-    process.platform === "darwin"
-      ? ["/opt/homebrew/bin/nginx", "/usr/local/bin/nginx"]
-      : ["/usr/sbin/nginx", "/usr/bin/nginx"];
-  return fallbacks.find((p) => existsSync(p)) ?? "nginx";
+  const candidates = NGINX_CANDIDATES[process.platform] ?? NGINX_CANDIDATES.default!;
+  const found = candidates.find((p) => existsSync(p));
+  if (!found) {
+    throw new Error(`nginx binary not found in standard locations: ${candidates.join(", ")}`);
+  }
+  return found;
+}
+
+/**
+ * Checks that a binary is safe to reference from a root sudoers rule: it must be
+ * owned by root and not writable by group or others. Returns a human-readable
+ * reason when unsafe, or null when fine. (On Homebrew macOS the prefix is
+ * user-owned, so callers warn rather than hard-fail.)
+ */
+export function untrustedBinaryReason(path: string): string | null {
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    return "not found";
+  }
+  if (!st.isFile()) return "not a regular file";
+  if (st.uid !== 0) return "not owned by root";
+  if (st.mode & 0o022) return "writable by group or others";
+  return null;
 }
 
 function findConfigFile(): string {
@@ -109,7 +150,8 @@ export async function ensureIncludeDir(includeDir: string): Promise<void> {
 
 /** Runs `nginx -t`; throws with combined output on failure. */
 export async function testConfig(): Promise<void> {
-  const res = await run(["nginx", "-t"]);
+  const bin = await resolveNginxBin();
+  const res = await run([bin, "-t"]);
   if (!res.ok) throw new Error(`nginx config test failed:\n${res.combined}`);
 }
 
@@ -127,7 +169,8 @@ export async function testConfigSudo(): Promise<{ ok: boolean; output: string }>
 }
 
 export async function reload(): Promise<void> {
-  const res = await run(["nginx", "-s", "reload"]);
+  const bin = await resolveNginxBin();
+  const res = await run([bin, "-s", "reload"]);
   if (!res.ok) throw new Error(`nginx reload failed:\n${res.combined}`);
 }
 
@@ -136,7 +179,8 @@ export async function start(): Promise<void> {
     const brew = await run(["brew", "services", "start", "nginx"]);
     if (brew.ok) return;
   }
-  const res = await run(["nginx"]);
+  const bin = await resolveNginxBin();
+  const res = await run([bin]);
   if (!res.ok) throw new Error(`failed to start nginx:\n${res.combined}`);
 }
 

@@ -26,14 +26,6 @@ export async function run(cmd: string[]): Promise<ExecResult> {
   };
 }
 
-/** Resolves the absolute path of a binary via `which`, or null if not found. */
-export async function which(bin: string): Promise<string | null> {
-  const res = await run(["/usr/bin/which", bin]);
-  if (!res.ok) return null;
-  const path = res.stdout.trim().split("\n")[0];
-  return path || null;
-}
-
 /**
  * True when running as a Bun-compiled standalone binary (as opposed to
  * `bun run src/index.ts`). Compiled binaries expose their entry point through
