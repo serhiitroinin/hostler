@@ -22,12 +22,17 @@ brew install hostler
 
 ### From source
 
+Requires [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`).
+
 ```bash
 git clone https://github.com/serhiitroinin/hostler.git
 cd hostler
-go build -o hostler .
+bun install
+bun run build          # produces a self-contained ./hostler binary
 sudo mv hostler /usr/local/bin/
 ```
+
+The compiled binary is standalone — Bun is only needed to build it, not to run it.
 
 ### Prerequisites
 
@@ -196,18 +201,26 @@ This is scoped to your user only and uses the minimum required privileges.
 
 ## Development
 
+Built with [Bun](https://bun.sh) + TypeScript.
+
 ```bash
 # Clone
 git clone https://github.com/serhiitroinin/hostler.git
 cd hostler
+bun install
 
-# Build
-go build -o hostler .
+# Run from source
+bun run start -- list
 
-# Initialize (one-time)
+# Typecheck + test (pure logic, no nginx/root required)
+bun run typecheck
+bun test
+
+# Build a standalone binary
+bun run build
+
+# Initialize (one-time) and try it
 sudo ./hostler init
-
-# Test locally
 ./hostler add test.loc 4000
 ./hostler list
 ./hostler remove test.loc
@@ -215,21 +228,36 @@ sudo ./hostler init
 
 ## Releasing
 
-Uses [GoReleaser](https://goreleaser.com/) for automated releases:
+Tag and push — `.github/workflows/release.yml` cross-compiles with Bun and
+publishes archives + checksums to a GitHub release:
 
 ```bash
-# Tag a release
-git tag v1.0.0
-git push origin v1.0.0
-
-# GoReleaser will automatically build and publish via GitHub Actions
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
-### Setting up Homebrew Tap
+`bun run build:all` cross-compiles binaries for linux/darwin on x64 and arm64
+into `dist/`.
 
-1. Create a repository called `homebrew-tap` in your GitHub account
-2. Add a secret called `HOMEBREW_TAP_GITHUB_TOKEN` to the hostler repo with a PAT that has write access to the tap repo
-3. GoReleaser will automatically update the formula on release
+## Troubleshooting
+
+### "conflicts" in `hostler status` / a port change does nothing
+
+If `hostler status` reports conflicting server names, a domain is defined in
+more than one nginx config and nginx silently ignores the duplicate — so
+changing its port can appear to have no effect.
+
+A common cause is a stale file from an older hostler version: the original
+release wrote a single `hostler-managed.conf` into the system nginx include
+directory, while the current version uses per-domain files in
+`~/.hostler/nginx/`. Remove the stale file and reload:
+
+```bash
+sudo rm "$(nginx -V 2>&1 | grep -o -- '--conf-path=[^ ]*' | cut -d= -f2 | xargs dirname)/servers/hostler-managed.conf"
+sudo nginx -s reload
+```
+
+(On Homebrew the path is usually `/opt/homebrew/etc/nginx/servers/hostler-managed.conf`.)
 
 ## License
 
