@@ -1,8 +1,8 @@
 // nginx detection, config generation/parsing, include-directive management, and
 // process control.
-import { existsSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { run } from "./exec.ts";
 import { writeFileAtomicSync } from "./fsatomic.ts";
 
@@ -94,21 +94,57 @@ export async function resolveNginxBin(): Promise<string> {
 }
 
 /**
- * Checks that a binary is safe to reference from a root sudoers rule: it must be
- * owned by root and not writable by group or others. Returns a human-readable
- * reason when unsafe, or null when fine. (On Homebrew macOS the prefix is
- * user-owned, so callers warn rather than hard-fail.)
+ * Checks that a binary is safe to reference from a root sudoers rule. It's not
+ * enough for the leaf file to be root-owned and unwritable: a root-owned 0755
+ * binary inside a user-writable directory can be unlinked/renamed and replaced,
+ * and a symlink along the path can be repointed. So every path component must be
+ * root-owned and not group/world-writable, symlinks are followed and their
+ * targets validated too, and the leaf must be a regular file.
+ *
+ * Returns a human-readable reason when unsafe, or null when fine. (On Homebrew
+ * macOS the prefix is user-owned, so callers warn / require an opt-in rather
+ * than silently trusting it.)
  */
 export function untrustedBinaryReason(path: string): string | null {
-  let st;
-  try {
-    st = statSync(path);
-  } catch {
-    return "not found";
+  return checkTrustedPath(path, 0);
+}
+
+function checkTrustedPath(path: string, depth: number): string | null {
+  if (depth > 16) return "too many symlink levels";
+  if (!isAbsolute(path)) return `not an absolute path: ${path}`;
+
+  const parts = path.split("/").filter(Boolean);
+  let current = "";
+  for (let i = 0; i < parts.length; i++) {
+    current += `/${parts[i]}`;
+    let st;
+    try {
+      st = lstatSync(current);
+    } catch {
+      return `not found: ${current}`;
+    }
+    if (st.uid !== 0) return `${current} is not owned by root`;
+
+    if (st.isSymbolicLink()) {
+      // Symlink perm bits are meaningless on Linux (always 0777); safety comes
+      // from the (already-validated) parent dir not being writable by non-root,
+      // plus the symlink being root-owned. Validate the target path too.
+      const target = readlinkSync(current);
+      const resolved = isAbsolute(target) ? target : resolve(dirname(current), target);
+      const rest = parts.slice(i + 1).join("/");
+      return checkTrustedPath(rest ? `${resolved}/${rest}` : resolved, depth + 1);
+    }
+
+    if (st.mode & 0o022) {
+      // A sticky directory (e.g. /tmp, 1777) is group/world-writable but others
+      // still can't delete or rename entries they don't own, so a root-owned
+      // file inside it can't be swapped out. Anything else writable is unsafe.
+      const stickyDir = st.isDirectory() && (st.mode & 0o1000) !== 0;
+      if (!stickyDir) return `${current} is writable by group or others`;
+    }
   }
-  if (!st.isFile()) return "not a regular file";
-  if (st.uid !== 0) return "not owned by root";
-  if (st.mode & 0o022) return "writable by group or others";
+
+  if (!lstatSync(path).isFile()) return `${path} is not a regular file`;
   return null;
 }
 
@@ -411,6 +447,42 @@ export async function removeIncludeDirective(configPath: string, userConfigDir: 
     `\\n\\s*# Hostler user configs\\n\\s*include ${escapeRegExp(userConfigDir)}/\\*\\.conf;`,
   );
   await writeFile(configPath, content.replace(re, ""));
+}
+
+/**
+ * Removes ANY include line referencing `dirPath`'s glob, regardless of the
+ * surrounding comment or whitespace (a previous/older/hand-edited install may
+ * not match the exact generated form). Reports whether a matching reference
+ * still remains afterward so the caller doesn't claim success when an unusual
+ * include form was left behind.
+ */
+export async function removeIncludeByPath(
+  configPath: string,
+  dirPath: string,
+): Promise<{ removed: boolean; stillPresent: boolean }> {
+  const content = await readFile(configPath, "utf8").catch(() => "");
+  if (!content) return { removed: false, stillPresent: false };
+
+  const includeRe = new RegExp(`^\\s*include\\s+${escapeRegExp(dirPath)}/\\*\\.conf\\s*;\\s*$`);
+  const hostlerCommentRe = /^\s*# Hostler user configs\s*$/;
+
+  const kept: string[] = [];
+  let removed = false;
+  for (const line of content.split("\n")) {
+    if (includeRe.test(line)) {
+      removed = true;
+      // Drop a hostler comment we may have written directly above the include.
+      if (kept.length > 0 && hostlerCommentRe.test(kept[kept.length - 1]!)) kept.pop();
+      continue;
+    }
+    kept.push(line);
+  }
+
+  const after = removed ? kept.join("\n") : content;
+  if (removed) await writeFile(configPath, after);
+  // Detect any other reference to the dir (e.g. bundled into a different include form).
+  const stillPresent = after.includes(`${dirPath}/*.conf`);
+  return { removed, stillPresent };
 }
 
 function escapeRegExp(s: string): string {
