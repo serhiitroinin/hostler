@@ -5,7 +5,7 @@ import {
   untrustedConfigDirReason,
   untrustedReloadTargetReason,
 } from "../src/lib/nginx.ts";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -58,6 +58,16 @@ describe("untrustedReloadTargetReason", () => {
     // A user can't create a child under /usr, so a missing include there is safe.
     if (existsSync("/usr")) {
       expect(untrustedReloadTargetReason("/usr/hostler-nonexistent-xyz/x.conf")).toBeNull();
+    }
+  });
+
+  test("rejects a sticky world-writable directory as a glob include dir", () => {
+    // The sticky-bit exception that lets /tmp host a binary does NOT apply to a
+    // dir an include glob loads — a user can drop a new .conf there.
+    const tmp = realpathSync("/tmp");
+    const mode = statSync(tmp).mode;
+    if ((mode & 0o022) !== 0 && (mode & 0o1000) !== 0) {
+      expect(untrustedReloadTargetReason(tmp)).toMatch(/writable by group or others/);
     }
   });
 });
