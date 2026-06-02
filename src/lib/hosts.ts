@@ -33,6 +33,7 @@ export async function hasDomain(hostsPath: string, domain: string): Promise<bool
  */
 export async function hasUnmanagedDomain(hostsPath: string, domain: string): Promise<boolean> {
   const content = await readFile(hostsPath, "utf8").catch(() => "");
+  const target = domain.toLowerCase(); // hostnames are case-insensitive
   let inBlock = false;
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
@@ -45,7 +46,8 @@ export async function hasUnmanagedDomain(hostsPath: string, domain: string): Pro
       continue;
     }
     if (inBlock || trimmed.startsWith("#") || trimmed === "") continue;
-    if (trimmed.split(/\s+/).slice(1).includes(domain)) return true;
+    const hostFields = trimmed.split(/\s+/).slice(1).map((f) => f.toLowerCase());
+    if (hostFields.includes(target)) return true;
   }
   return false;
 }
