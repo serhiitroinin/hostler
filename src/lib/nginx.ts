@@ -669,21 +669,26 @@ export async function findConflicts(
 
 // --- Include directive management ------------------------------------------
 
-/** True if nginx.conf already includes the user config dir. */
+/**
+ * True if nginx.conf has an ACTIVE include of the user config dir. Uses the
+ * directive tokenizer rather than a raw substring search, so a commented-out
+ * `# include <dir>/*.conf;` is correctly NOT treated as present (otherwise init
+ * would skip inserting the real directive and configs would never load).
+ */
 export async function hasIncludeDirective(configPath: string, userConfigDir: string): Promise<boolean> {
   const content = await readFile(configPath, "utf8").catch(() => "");
-  return content.includes(`include ${userConfigDir}/*.conf;`);
+  return scanIncludeArgs(content).includes(`${userConfigDir}/*.conf`);
 }
 
 /**
  * Adds an `include <userConfigDir>/*.conf;` directive inside the http block.
- * Returns true if added, false if it was already present.
+ * Returns true if added, false if an ACTIVE (non-commented) one already exists.
  */
 export async function addIncludeDirective(configPath: string, userConfigDir: string): Promise<boolean> {
   const content = await readFile(configPath, "utf8");
-  const includeLine = `include ${userConfigDir}/*.conf;`;
-  if (content.includes(includeLine)) return false;
+  if (scanIncludeArgs(content).includes(`${userConfigDir}/*.conf`)) return false;
 
+  const includeLine = `include ${userConfigDir}/*.conf;`;
   const inserted = insertIntoHttpBlock(content, `    # Hostler user configs\n    ${includeLine}\n`);
   if (inserted === null) {
     throw new Error("could not find http block in nginx.conf");
