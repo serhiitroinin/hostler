@@ -2,7 +2,7 @@
 // daily use: create the root-owned config dir under /etc, add the nginx
 // include, and install a minimal per-user sudoers rule.
 import { existsSync } from "node:fs";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { writeFile, mkdir, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
   getUserConfigDir,
@@ -17,11 +17,15 @@ import { printError, printInfo, printOk, printWarn, rule } from "../lib/ui.ts";
 const LEGACY_SUDOERS_PATH = "/etc/sudoers.d/hostler";
 const ALLOW_UNTRUSTED_FLAG = "--allow-untrusted-binaries";
 
-// sudo ignores files in sudoers.d whose names contain a dot, so the per-user
-// filename must be sanitized (usernames may legitimately contain dots).
-export function sudoersPathFor(username: string): string {
-  const safe = username.replace(/[^A-Za-z0-9_-]/g, "_");
-  return `/etc/sudoers.d/hostler-${safe}`;
+/**
+ * Per-user sudoers filename keyed on the numeric UID. A UID is unique, always
+ * filename-safe, and dot-free (sudo ignores sudoers.d files containing a dot).
+ * Sanitizing the username instead would collide — `first.last` and `first_last`
+ * both map to the same name.
+ */
+export function sudoersPathFor(uid: number): string {
+  if (!Number.isInteger(uid) || uid < 0) throw new Error(`invalid uid: ${uid}`);
+  return `/etc/sudoers.d/hostler-${uid}`;
 }
 
 export async function init(args: string[] = []): Promise<void> {
@@ -44,7 +48,8 @@ export async function init(args: string[] = []): Promise<void> {
   }
 
   const username = process.env.SUDO_USER;
-  if (!username) {
+  const uid = Number.parseInt(process.env.SUDO_UID ?? "", 10);
+  if (!username || !Number.isInteger(uid)) {
     printError("Could not determine user. Run via sudo (sudo hostler init), not as root directly.");
     process.exit(1);
   }
@@ -53,7 +58,20 @@ export async function init(args: string[] = []): Promise<void> {
   console.log("hostler init");
   console.log(rule());
 
-  // Step 1: detect nginx.
+  // Step 0: resolve nginx's path and validate trust BEFORE executing it.
+  // detect() runs `nginx -V`, so the trust check has to come first — otherwise a
+  // user-controlled nginx would run as root before the fail-closed guard fires.
+  printInfo("Verifying binaries...");
+  let nginxBin: string;
+  try {
+    nginxBin = await nginx.resolveNginxBin(); // path lookup only, no execution
+  } catch (err) {
+    printError(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+  await assertTrustedBinaries(nginxBin, allowUntrusted);
+
+  // Step 1: detect nginx (now safe to execute it).
   printInfo("Detecting nginx...");
   let cfg: nginx.NginxConfig;
   try {
@@ -64,10 +82,6 @@ export async function init(args: string[] = []): Promise<void> {
   }
   console.log(`  nginx version: ${cfg.version}`);
   console.log(`  nginx config: ${cfg.mainConfigPath}`);
-
-  // Fail closed early if a binary we'd reference from a NOPASSWD rule isn't
-  // safe, before changing any system state.
-  await assertTrustedBinaries(await nginx.resolveNginxBin(), allowUntrusted);
 
   // Make sure nginx's include dir exists (detect() no longer creates it).
   try {
@@ -124,7 +138,7 @@ export async function init(args: string[] = []): Promise<void> {
   // Step 5: install the per-user sudoers rule.
   console.log();
   printInfo("Setting up passwordless sudo...");
-  const sudoersPath = sudoersPathFor(username);
+  const sudoersPath = sudoersPathFor(uid);
   try {
     await createSudoersFile(username, sudoersPath);
   } catch (err) {
@@ -201,13 +215,23 @@ async function migrateOldInstall(username: string, configDir: string, mainConfig
       migrated++;
     }
   }
-
-  // Neutralize the old include (the security-critical part) and remove the dir.
-  await nginx.removeIncludeDirective(mainConfigPath, oldDir);
-  await rm(join(home, ".hostler"), { recursive: true, force: true });
-
   if (migrated > 0) printOk(`  Migrated ${migrated} domain(s) from ${oldDir}`);
-  printOk(`  Removed legacy include and ${oldDir}`);
+
+  // Neutralize the old include (the security-critical part). Match by path, not
+  // by exact generated form, and verify it's actually gone before claiming so.
+  const { removed, stillPresent } = await nginx.removeIncludeByPath(mainConfigPath, oldDir);
+  if (stillPresent) {
+    printWarn(`  Warning: an include referencing ${oldDir} remains in ${mainConfigPath}.`);
+    printWarn("           Remove it manually — nginx is still including a user-writable directory.");
+  } else if (removed) {
+    printOk(`  Removed legacy include for ${oldDir}`);
+  }
+
+  // Delete only the old nginx config dir (not the whole ~/.hostler, which may
+  // hold unrelated data), then drop ~/.hostler if it's now empty.
+  await rm(oldDir, { recursive: true, force: true });
+  await rmdir(join(home, ".hostler")).catch(() => {});
+  printOk(`  Removed ${oldDir}`);
 }
 
 async function createSudoersFile(username: string, sudoersPath: string): Promise<void> {
@@ -225,11 +249,15 @@ async function createSudoersFile(username: string, sudoersPath: string): Promise
     throw new Error(`invalid sudoers syntax: ${check.combined}`);
   }
 
-  // Retire the old single-user shared file so it can't leave a dangling rule
-  // pointing at a previous binary path.
-  if (existsSync(LEGACY_SUDOERS_PATH)) {
-    await rm(LEGACY_SUDOERS_PATH, { force: true });
-    printWarn(`  Removed legacy shared sudoers file ${LEGACY_SUDOERS_PATH}`);
+  // Retire older sudoers files (the original shared file, and the earlier
+  // username-keyed form) so they can't leave a dangling rule pointing at a
+  // previous binary path.
+  const legacyUsernameForm = `/etc/sudoers.d/hostler-${username.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+  for (const legacy of [LEGACY_SUDOERS_PATH, legacyUsernameForm]) {
+    if (legacy !== sudoersPath && existsSync(legacy)) {
+      await rm(legacy, { force: true });
+      printWarn(`  Removed stale sudoers file ${legacy}`);
+    }
   }
 }
 
