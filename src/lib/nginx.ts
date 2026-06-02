@@ -125,7 +125,16 @@ export function untrustedConfigDirReason(path: string): string | null {
   return checkTrustedPath(path, "dir", 0);
 }
 
-function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): string | null {
+// "file"    — leaf is a regular file (e.g. a binary or a config file).
+// "dir"     — leaf is a directory we won't load new files from.
+// "globdir" — leaf is a directory whose contents an `include glob` loads. The
+//             sticky-bit exception does NOT apply to such a leaf: sticky stops
+//             you replacing others' files, but a user can still CREATE a new
+//             matching .conf in a world-writable sticky dir (e.g. /tmp) and have
+//             a passwordless reload load it.
+type Leaf = "file" | "dir" | "globdir";
+
+function checkTrustedPath(path: string, leaf: Leaf, depth: number): string | null {
   if (depth > 16) return "too many symlink levels";
   if (!isAbsolute(path)) return `not an absolute path: ${path}`;
 
@@ -133,6 +142,7 @@ function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): st
   let current = "";
   for (let i = 0; i < parts.length; i++) {
     current += `/${parts[i]}`;
+    const isFinal = i === parts.length - 1;
     let st;
     try {
       st = lstatSync(current);
@@ -153,16 +163,20 @@ function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): st
 
     if (st.mode & 0o022) {
       // A sticky directory (e.g. /tmp, 1777) is group/world-writable but others
-      // still can't delete or rename entries they don't own, so a root-owned
-      // file inside it can't be swapped out. Anything else writable is unsafe.
+      // can't delete or rename entries they don't own — safe as a PARENT (a
+      // root-owned child can't be swapped). But it is NOT safe as a glob include
+      // dir, where a user can create a brand-new matching file.
       const stickyDir = st.isDirectory() && (st.mode & 0o1000) !== 0;
-      if (!stickyDir) return `${current} is writable by group or others`;
+      const stickyOk = stickyDir && !(leaf === "globdir" && isFinal);
+      if (!stickyOk) return `${current} is writable by group or others`;
     }
   }
 
   const finalSt = lstatSync(path);
   if (leaf === "file" && !finalSt.isFile()) return `${path} is not a regular file`;
-  if (leaf === "dir" && !finalSt.isDirectory()) return `${path} is not a directory`;
+  if ((leaf === "dir" || leaf === "globdir") && !finalSt.isDirectory()) {
+    return `${path} is not a directory`;
+  }
   return null;
 }
 
@@ -185,7 +199,13 @@ export async function collectIncludeTargets(mainConfigPath: string, maxDepth = 3
 
   while (queue.length > 0) {
     const { file, depth } = queue.shift()!;
-    if (depth > maxDepth) continue;
+    if (depth > maxDepth) {
+      // Fail closed: an include chain deeper than the limit means we can't fully
+      // verify the tree, so emit a target that untrustedReloadTargetReason rejects
+      // rather than silently stopping.
+      targets.add(DEPTH_MARKER + file);
+      continue;
+    }
     const real = realpathSafe(file);
     if (visited.has(real)) continue;
     visited.add(real);
@@ -285,14 +305,24 @@ function realpathSafe(p: string): string {
   }
 }
 
+// Sentinel prefix collectIncludeTargets emits when an include chain exceeds the
+// recursion limit, so the depth cap fails closed instead of silently truncating.
+const DEPTH_MARKER = "\0depth-exceeded:";
+
 /**
  * Trust reason for a path that a reload would load, accounting for non-existence.
  * If the target is missing, the nearest existing ancestor must be trusted —
  * otherwise an unprivileged user could create the missing path (e.g. an absent
  * `/Users/alice/nginx` glob dir) and load arbitrary config via passwordless
- * reload. Returns null when safe.
+ * reload. Directories that bound include globs are checked with "globdir", which
+ * rejects sticky world-writable dirs (a user can still create a new matching
+ * file there). Returns null when safe.
  */
 export function untrustedReloadTargetReason(target: string): string | null {
+  if (target.startsWith(DEPTH_MARKER)) {
+    return `include depth limit exceeded at ${target.slice(DEPTH_MARKER.length)}; cannot verify the full reload tree`;
+  }
+
   // A wildcard reaching here means an include glob with a wildcard before its
   // basename (e.g. `/etc/nginx/*/*.conf`): no single directory bounds where a
   // matching file could appear, so we can't prove the tree is root-owned. Fail
@@ -307,10 +337,12 @@ export function untrustedReloadTargetReason(target: string): string | null {
   } catch {
     const ancestor = nearestExistingAncestor(target);
     if (!ancestor) return null;
-    const reason = checkTrustedPath(ancestor, "dir", 0);
+    // The missing path could be created in its nearest existing ancestor, so
+    // that ancestor must itself be a non-(sticky-)writable dir → "globdir".
+    const reason = checkTrustedPath(ancestor, "globdir", 0);
     return reason ? `${target} is missing and could be created — ${reason}` : null;
   }
-  return st.isDirectory() ? untrustedConfigDirReason(target) : untrustedFileReason(target);
+  return st.isDirectory() ? checkTrustedPath(target, "globdir", 0) : untrustedFileReason(target);
 }
 
 function nearestExistingAncestor(path: string): string | null {
