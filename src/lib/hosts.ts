@@ -26,6 +26,30 @@ export async function hasDomain(hostsPath: string, domain: string): Promise<bool
   return false;
 }
 
+/**
+ * True if `domain` appears on an active line OUTSIDE hostler's managed block.
+ * Such an entry would shadow (or compete with) the one hostler manages — and
+ * hostler must not silently claim to have "updated" a line it doesn't own.
+ */
+export async function hasUnmanagedDomain(hostsPath: string, domain: string): Promise<boolean> {
+  const content = await readFile(hostsPath, "utf8").catch(() => "");
+  let inBlock = false;
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === BEGIN_MARKER) {
+      inBlock = true;
+      continue;
+    }
+    if (trimmed === END_MARKER) {
+      inBlock = false;
+      continue;
+    }
+    if (inBlock || trimmed.startsWith("#") || trimmed === "") continue;
+    if (trimmed.split(/\s+/).slice(1).includes(domain)) return true;
+  }
+  return false;
+}
+
 /** Returns the domains currently inside hostler's managed block. */
 export async function getManagedDomains(hostsPath: string): Promise<string[]> {
   const content = await readFile(hostsPath, "utf8").catch(() => "");
