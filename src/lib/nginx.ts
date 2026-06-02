@@ -1,6 +1,6 @@
 // nginx detection, config generation/parsing, include-directive management, and
 // process control.
-import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { run } from "./exec.ts";
@@ -204,10 +204,20 @@ export async function collectIncludeTargets(mainConfigPath: string, maxDepth = 3
       let inc = m[1]!.trim().replace(/^["']|["']$/g, "");
       if (!isAbsolute(inc)) inc = resolve(baseDir, inc);
 
-      if (/[*?[\]]/.test(basename(inc))) {
-        const dir = dirname(inc);
-        targets.add(dir);
-        for (const f of globFiles(dir, basename(inc))) queue.push({ file: f, depth: depth + 1 });
+      if (GLOB_CHARS.test(inc)) {
+        for (const t of expandGlobInclude(inc)) {
+          targets.add(t);
+          // Follow matched files (concrete paths) for nested includes.
+          if (!GLOB_CHARS.test(t)) {
+            let st: ReturnType<typeof lstatSync> | null = null;
+            try {
+              st = lstatSync(t);
+            } catch {
+              st = null;
+            }
+            if (st?.isFile()) queue.push({ file: t, depth: depth + 1 });
+          }
+        }
       } else {
         targets.add(inc);
         let st: ReturnType<typeof lstatSync> | null = null;
@@ -223,26 +233,56 @@ export async function collectIncludeTargets(mainConfigPath: string, maxDepth = 3
   return [...targets];
 }
 
+const GLOB_CHARS = /[*?[\]]/;
+
+/**
+ * Expands a glob include into the set of paths to trust-check:
+ *  - every currently-matching file (so a writable file in an otherwise
+ *    root-owned dir is caught — a glob dir being trusted isn't enough), and
+ *  - a directory that bounds future matches.
+ *
+ * When the wildcard is only in the basename (e.g. `conf.d/<star>.conf`), the
+ * containing directory bounds future files, so it's returned. When a wildcard
+ * appears in an earlier component (e.g. `<star>/<star>.conf`), no single
+ * existing dir bounds where a matching file could later appear, so the raw
+ * pattern is returned unchanged — untrustedReloadTargetReason rejects any
+ * wildcard path, failing the check closed.
+ */
+function expandGlobInclude(inc: string): string[] {
+  const out = new Set<string>();
+  const parts = inc.split("/");
+  const globIdx = parts.findIndex((p) => GLOB_CHARS.test(p));
+  const fixedPrefix = parts.slice(0, globIdx).join("/") || "/";
+  const subPattern = parts.slice(globIdx).join("/");
+  const wildcardOnlyInBasename = globIdx === parts.length - 1;
+
+  // Enumerate current matches with a real glob engine (handles multi-level).
+  try {
+    for (const f of new Bun.Glob(subPattern).scanSync({
+      cwd: fixedPrefix,
+      absolute: true,
+      onlyFiles: true,
+    })) {
+      out.add(f);
+    }
+  } catch {
+    // unreadable/missing prefix — nothing currently matches
+  }
+
+  if (wildcardOnlyInBasename) {
+    out.add(fixedPrefix); // bounds future files in this dir
+  } else {
+    out.add(inc); // unbounded — keep the wildcard so it fails closed
+  }
+  return [...out];
+}
+
 function realpathSafe(p: string): string {
   try {
     return realpathSync(p);
   } catch {
     return p;
   }
-}
-
-// Lists absolute paths of files in `dir` matching a simple nginx glob (* and ?).
-function globFiles(dir: string, pattern: string): string[] {
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return [];
-  }
-  const re = new RegExp(
-    `^${pattern.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`,
-  );
-  return names.filter((n) => re.test(n)).map((n) => join(dir, n));
 }
 
 /**
@@ -253,6 +293,14 @@ function globFiles(dir: string, pattern: string): string[] {
  * reload. Returns null when safe.
  */
 export function untrustedReloadTargetReason(target: string): string | null {
+  // A wildcard reaching here means an include glob with a wildcard before its
+  // basename (e.g. `/etc/nginx/*/*.conf`): no single directory bounds where a
+  // matching file could appear, so we can't prove the tree is root-owned. Fail
+  // closed and let the user restructure the include or pass --allow-untrusted.
+  if (GLOB_CHARS.test(target)) {
+    return `${target} has a wildcard path component that can't be verified`;
+  }
+
   let st: ReturnType<typeof lstatSync>;
   try {
     st = lstatSync(target);

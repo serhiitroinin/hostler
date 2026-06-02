@@ -44,10 +44,14 @@ describe("untrustedConfigDirReason", () => {
 describe("untrustedReloadTargetReason", () => {
   test("flags a missing target whose nearest existing parent is user-owned", () => {
     const dir = mkdtempSync(join(tmpdir(), "hostler-rt-"));
-    // The glob dir doesn't exist yet, but the user owns the parent and could
-    // create it, then drop configs that root would reload.
-    const missing = join(dir, "newsub", "*.conf");
+    // The dir doesn't exist yet, but the user owns the parent and could create
+    // it, then drop configs that root would reload.
+    const missing = join(dir, "newsub");
     expect(untrustedReloadTargetReason(missing)).toMatch(/missing and could be created/);
+  });
+
+  test("fails closed on a wildcard path component (unbounded glob)", () => {
+    expect(untrustedReloadTargetReason("/etc/nginx/sub/*.conf")).toMatch(/wildcard path component/);
   });
 
   test("allows a missing target under a root-owned, unwritable parent", () => {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { collectIncludeTargets, insertIntoHttpBlock } from "../src/lib/nginx.ts";
 import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,6 +80,31 @@ describe("collectIncludeTargets", () => {
     expect(targets).toContain("/etc/nginx/conf.d");
     expect(targets).toContain(join(dir, "servers"));
     expect(targets).toContain("/etc/nginx/mime.types");
+  });
+
+  test("adds each glob-matched file as a target (not just the directory)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const confd = join(dir, "conf.d");
+    mkdirSync(confd);
+    writeFileSync(join(confd, "app.conf"), "# server block\n");
+    writeFileSync(join(confd, "api.conf"), "# server block\n");
+    const main = join(dir, "nginx.conf");
+    writeFileSync(main, "include conf.d/*.conf;\n");
+
+    const targets = await collectIncludeTargets(main);
+    // The directory AND each matched file must be present so a writable file in
+    // an otherwise root-owned dir gets trust-checked.
+    expect(targets).toContain(confd);
+    expect(targets).toContain(join(confd, "app.conf"));
+    expect(targets).toContain(join(confd, "api.conf"));
+  });
+
+  test("keeps a pre-basename wildcard as a target so it fails closed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const main = join(dir, "nginx.conf");
+    writeFileSync(main, "include /etc/nginx/sites/*/*.conf;\n");
+    const targets = await collectIncludeTargets(main);
+    expect(targets.some((t) => t.includes("*"))).toBe(true);
   });
 
   test("recurses through included files and survives cycles", async () => {
