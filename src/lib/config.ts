@@ -8,7 +8,7 @@
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { run } from "./exec.ts";
 
 export const SYSTEM_CONFIG_BASE = "/etc/hostler";
@@ -17,6 +17,16 @@ export const INIT_MARKER_FILE = ".initialized";
 // Unix usernames are restricted; reject anything that could escape the base dir.
 function sanitizeUsername(name: string): string {
   if (!/^[a-zA-Z0-9._][a-zA-Z0-9._-]*$/.test(name) || name.length > 32) {
+    throw new Error(`unsafe username: ${name}`);
+  }
+  // "." and "..", though they match the charset, are path traversal: they'd
+  // resolve getUserConfigDir to /etc/hostler or /etc itself.
+  if (name === "." || name === "..") {
+    throw new Error(`unsafe username: ${name}`);
+  }
+  // Assert the resulting path actually stays directly under the base dir.
+  const full = resolve(SYSTEM_CONFIG_BASE, name);
+  if (full !== join(SYSTEM_CONFIG_BASE, name) || !full.startsWith(SYSTEM_CONFIG_BASE + sep)) {
     throw new Error(`unsafe username: ${name}`);
   }
   return name;
