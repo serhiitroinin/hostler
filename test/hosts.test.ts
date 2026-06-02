@@ -2,7 +2,13 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addEntry, getManagedDomains, hasDomain, removeEntry } from "../src/lib/hosts.ts";
+import {
+  addEntry,
+  getManagedDomains,
+  hasDomain,
+  hasUnmanagedDomain,
+  removeEntry,
+} from "../src/lib/hosts.ts";
 import { isValidDomain } from "../src/lib/domain.ts";
 
 let hostsPath: string;
@@ -43,6 +49,21 @@ test("removing the last domain leaves no managed block", async () => {
   await removeEntry(hostsPath, "app.loc");
   const content = await readFile(hostsPath, "utf8");
   expect(content).not.toContain("BEGIN hostler");
+});
+
+test("hasUnmanagedDomain only flags entries outside the managed block", async () => {
+  // An entry hostler manages (inside the block) is not "unmanaged".
+  await addEntry(hostsPath, "managed.loc");
+  expect(await hasUnmanagedDomain(hostsPath, "managed.loc")).toBe(false);
+
+  // A hand-added entry outside the block is.
+  const content = await readFile(hostsPath, "utf8");
+  await writeFile(hostsPath, `127.0.0.1\tstale.loc\n${content}`);
+  expect(await hasUnmanagedDomain(hostsPath, "stale.loc")).toBe(true);
+
+  // Commented lines don't count.
+  await writeFile(hostsPath, "# 127.0.0.1 commented.loc\n");
+  expect(await hasUnmanagedDomain(hostsPath, "commented.loc")).toBe(false);
 });
 
 test("hasDomain matches whole fields, not substrings", async () => {
