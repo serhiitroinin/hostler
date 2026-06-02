@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdir } from "node:fs/promises";
 import {
+  findDomainInOtherUserDirs,
   findEntry,
   generateServerBlock,
   parseConfigFile,
@@ -58,5 +60,26 @@ describe("parseUserConfigs", () => {
 
   test("returns empty for a missing directory", async () => {
     expect(await parseUserConfigs(join(dir, "nope"))).toEqual([]);
+  });
+});
+
+describe("findDomainInOtherUserDirs", () => {
+  test("finds a domain configured under a sibling user's dir", async () => {
+    // dir acts as /etc/hostler; self and other are sibling <user> dirs.
+    const self = join(dir, "alice");
+    const other = join(dir, "bob");
+    await mkdir(self);
+    await mkdir(other);
+    await writeFile(join(other, "app.loc.conf"), generateServerBlock("app.loc", 3000));
+
+    expect(await findDomainInOtherUserDirs("app.loc", self)).toBe(other);
+    expect(await findDomainInOtherUserDirs("other.loc", self)).toBeNull();
+  });
+
+  test("ignores the caller's own dir", async () => {
+    const self = join(dir, "alice");
+    await mkdir(self);
+    await writeFile(join(self, "mine.loc.conf"), generateServerBlock("mine.loc", 3000));
+    expect(await findDomainInOtherUserDirs("mine.loc", self)).toBeNull();
   });
 });
