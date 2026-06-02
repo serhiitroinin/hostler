@@ -1,6 +1,6 @@
 // nginx detection, config generation/parsing, include-directive management, and
 // process control.
-import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { run } from "./exec.ts";
@@ -218,39 +218,100 @@ export async function collectIncludeTargets(mainConfigPath: string, maxDepth = 3
     }
     const baseDir = dirname(file);
 
-    const re = /^\s*include\s+([^;]+);/gm;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(content)) !== null) {
-      let inc = m[1]!.trim().replace(/^["']|["']$/g, "");
+    for (let inc of scanIncludeArgs(content)) {
       if (!isAbsolute(inc)) inc = resolve(baseDir, inc);
 
       if (GLOB_CHARS.test(inc)) {
         for (const t of expandGlobInclude(inc)) {
           targets.add(t);
-          // Follow matched files (concrete paths) for nested includes.
-          if (!GLOB_CHARS.test(t)) {
-            let st: ReturnType<typeof lstatSync> | null = null;
-            try {
-              st = lstatSync(t);
-            } catch {
-              st = null;
-            }
-            if (st?.isFile()) queue.push({ file: t, depth: depth + 1 });
-          }
+          if (!GLOB_CHARS.test(t)) maybeQueueFile(t, depth, queue);
         }
       } else {
         targets.add(inc);
-        let st: ReturnType<typeof lstatSync> | null = null;
-        try {
-          st = lstatSync(inc);
-        } catch {
-          st = null;
-        }
-        if (st?.isFile()) queue.push({ file: inc, depth: depth + 1 });
+        maybeQueueFile(inc, depth, queue);
       }
     }
   }
   return [...targets];
+}
+
+// Queues a file for include-parsing if it resolves (through symlinks) to a
+// regular file. statSync follows symlinks — unlike lstatSync, which reports a
+// symlink as non-file and would skip nested includes in a symlinked config
+// (common in sites-enabled setups), the exact case nginx does follow.
+function maybeQueueFile(
+  path: string,
+  depth: number,
+  queue: Array<{ file: string; depth: number }>,
+): void {
+  try {
+    if (statSync(path).isFile()) queue.push({ file: path, depth: depth + 1 });
+  } catch {
+    // missing / broken symlink — nothing to parse
+  }
+}
+
+/**
+ * Extracts the argument of every `include` directive in an nginx config.
+ *
+ * nginx directives are semicolon-delimited and can appear anywhere (including
+ * inline, e.g. `http { include conf/*.conf; }`), so a line-anchored regex would
+ * miss them. This is a small tokenizer that respects `#` comments and quoted
+ * strings, splits on whitespace, and treats `;`/`{`/`}` as boundaries — then
+ * picks the second token of any statement whose first token is `include`.
+ */
+export function scanIncludeArgs(content: string): string[] {
+  const includes: string[] = [];
+  let tokens: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+
+  const pushTok = () => {
+    if (cur) {
+      tokens.push(cur);
+      cur = "";
+    }
+  };
+  const endStatement = () => {
+    pushTok();
+    if (tokens.length >= 2 && tokens[0] === "include") includes.push(tokens[1]!);
+    tokens = [];
+  };
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i]!;
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === "#") {
+      pushTok();
+      while (i < content.length && content[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ";") {
+      endStatement();
+      continue;
+    }
+    if (ch === "{" || ch === "}") {
+      // Block boundary: discard the preceding directive name/args (a block
+      // directive is never `include`).
+      cur = "";
+      tokens = [];
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushTok();
+      continue;
+    }
+    cur += ch;
+  }
+  return includes;
 }
 
 const GLOB_CHARS = /[*?[\]]/;
