@@ -1,7 +1,7 @@
 // `sudo hostler init` — one-time privileged setup that enables passwordless
 // daily use: create the root-owned config dir under /etc, add the nginx
 // include, and install a minimal per-user sudoers rule.
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { writeFile, mkdir, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -15,7 +15,11 @@ import * as nginx from "../lib/nginx.ts";
 import { printError, printInfo, printOk, printWarn, rule } from "../lib/ui.ts";
 
 const LEGACY_SUDOERS_PATH = "/etc/sudoers.d/hostler";
-const ALLOW_UNTRUSTED_FLAG = "--allow-untrusted-binaries";
+// Opt-in to proceed when the environment (binaries OR the nginx config tree that
+// `reload` loads) is user-writable, e.g. Homebrew's user-owned prefix. The older
+// `--allow-untrusted-binaries` name is kept as an alias. It does NOT bypass a
+// stale legacy include or an unsafe config dir — those always fail closed.
+const ALLOW_UNTRUSTED_FLAGS = ["--allow-untrusted", "--allow-untrusted-binaries"];
 
 /**
  * Per-user sudoers filename keyed on the numeric UID. A UID is unique, always
@@ -29,7 +33,7 @@ export function sudoersPathFor(uid: number): string {
 }
 
 export async function init(args: string[] = []): Promise<void> {
-  const allowUntrusted = args.includes(ALLOW_UNTRUSTED_FLAG);
+  const allowUntrusted = args.some((a) => ALLOW_UNTRUSTED_FLAGS.includes(a));
 
   if (!(process.getuid && process.getuid() === 0)) {
     printError("This command requires root privileges. Please run with sudo.");
@@ -119,7 +123,16 @@ export async function init(args: string[] = []): Promise<void> {
   // remove its include so the upgrade doesn't keep including an unsafe path. This
   // runs even when the old dir is gone (a stale include can outlive it) and fails
   // closed if the include can't be fully removed.
-  await migrateOldInstall(username, configDir, cfg.mainConfigPath, allowUntrusted);
+  await migrateOldInstall(username, configDir, cfg.mainConfigPath);
+
+  // Step 2c: the sudoers rule will grant passwordless `nginx -s reload`, which
+  // loads nginx.conf and everything it already includes. Verify that tree is
+  // root-owned before we commit to anything. Our own config dir was validated
+  // above; here we check nginx.conf and its existing include targets.
+  console.log();
+  printInfo("Verifying nginx config tree...");
+  await assertTrustedReloadTree(cfg.mainConfigPath, allowUntrusted);
+  printOk("  nginx config tree is trusted");
 
   // Step 3: add the include directive to nginx.conf.
   console.log();
@@ -200,11 +213,51 @@ async function assertTrustedBinaries(nginxPath: string, allowUntrusted: boolean)
     console.log("\nAnyone who can modify that binary could run it as root via the sudoers rule.");
     console.log("Fix it by installing hostler/nginx to a root-owned path, e.g.:");
     console.log("  sudo install -o root -m 0755 ./hostler /usr/local/bin/hostler");
-    console.log(`\nOr, to proceed anyway and accept the risk, re-run with ${ALLOW_UNTRUSTED_FLAG}.`);
+    console.log("\nOr, to proceed anyway and accept the risk, re-run with --allow-untrusted.");
     process.exit(1);
   }
 
-  printWarn("  Proceeding with untrusted binaries (--allow-untrusted-binaries):");
+  printWarn("  Proceeding with untrusted binaries (--allow-untrusted):");
+  for (const p of problems) printWarn(`    - ${p}`);
+}
+
+/**
+ * Validates the nginx config tree that a passwordless `nginx -s reload` would
+ * load: nginx.conf itself and the directories/files its include directives
+ * reference. If any is user-writable, granting passwordless reload would let the
+ * user load arbitrary config as root. Gated by --allow-untrusted (same
+ * environmental risk as untrusted binaries, e.g. Homebrew's user-owned prefix).
+ */
+async function assertTrustedReloadTree(mainConfigPath: string, allowUntrusted: boolean): Promise<void> {
+  const problems: string[] = [];
+
+  const mainReason = nginx.untrustedFileReason(mainConfigPath);
+  if (mainReason) problems.push(`nginx config ${mainConfigPath}: ${mainReason}`);
+
+  for (const target of await nginx.collectIncludeTargets(mainConfigPath)) {
+    let st;
+    try {
+      st = lstatSync(target);
+    } catch {
+      continue; // referenced path doesn't exist — nothing to load
+    }
+    const reason = st.isDirectory()
+      ? nginx.untrustedConfigDirReason(target)
+      : nginx.untrustedFileReason(target);
+    if (reason) problems.push(`include ${target}: ${reason}`);
+  }
+
+  if (problems.length === 0) return;
+
+  if (!allowUntrusted) {
+    printError("refusing to grant passwordless 'nginx -s reload' over a user-writable config tree:");
+    for (const p of problems) console.log(`  - ${p}`);
+    console.log("\nAnyone who can write those paths could load arbitrary config as root.");
+    console.log("Use root-owned nginx config/include dirs, or re-run with --allow-untrusted.");
+    process.exit(1);
+  }
+
+  printWarn("  Proceeding with an untrusted nginx config tree (--allow-untrusted):");
   for (const p of problems) printWarn(`    - ${p}`);
 }
 
@@ -215,17 +268,22 @@ async function assertTrustedBinaries(nginxPath: string, allowUntrusted: boolean)
  * directory, and a user could later recreate the home-owned dir and trigger a
  * passwordless reload. Fails closed if the include can't be fully removed.
  */
-async function migrateOldInstall(
-  username: string,
-  configDir: string,
-  mainConfigPath: string,
-  allowUntrusted: boolean,
-): Promise<void> {
+async function migrateOldInstall(username: string, configDir: string, mainConfigPath: string): Promise<void> {
   const home = await resolveUserHome(username);
   if (!home) {
-    printWarn("  Could not resolve home dir; skipping legacy include cleanup.");
+    // Can't locate the legacy dir to clean its include. Fail closed if nginx.conf
+    // still references a ~/.hostler/nginx path — proceeding could leave a stale
+    // user-writable include armed. Otherwise there's nothing to clean.
+    const content = await Bun.file(mainConfigPath).text().catch(() => "");
+    if (/\.hostler\/nginx\//.test(content)) {
+      printError("could not resolve your home directory to clean up a legacy include.");
+      console.log(`nginx.conf still references a ~/.hostler/nginx path. Remove that include line`);
+      console.log(`manually from ${mainConfigPath}, then re-run init.`);
+      process.exit(1);
+    }
     return;
   }
+
   const oldDir = join(home, ".hostler", "nginx");
   const oldDirExists = existsSync(oldDir);
 
@@ -243,18 +301,17 @@ async function migrateOldInstall(
   }
 
   // ALWAYS neutralize any legacy include for the old path, present dir or not.
+  // This ALWAYS fails closed if it can't be fully removed — a leftover
+  // user-writable include is an escalation path, not an environmental quirk, so
+  // --allow-untrusted does not bypass it.
   const { removed, stillPresent } = await nginx.removeIncludeByPath(mainConfigPath, oldDir);
-  if (stillPresent && !allowUntrusted) {
+  if (stillPresent) {
     printError(`a legacy include referencing ${oldDir} remains in ${mainConfigPath}.`);
     console.log("nginx would keep including a user-writable directory. Remove that include line");
-    console.log(`manually, or re-run with ${ALLOW_UNTRUSTED_FLAG} to proceed anyway.`);
+    console.log("manually, then re-run init.");
     process.exit(1);
   }
-  if (stillPresent) {
-    printWarn(`  Proceeding despite a remaining include for ${oldDir} (--allow-untrusted-binaries).`);
-  } else if (removed) {
-    printOk(`  Removed legacy include for ${oldDir}`);
-  }
+  if (removed) printOk(`  Removed legacy include for ${oldDir}`);
 
   // Delete only the old nginx config dir (not the whole ~/.hostler, which may
   // hold unrelated data), then drop ~/.hostler if it's now empty.

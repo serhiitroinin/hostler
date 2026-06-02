@@ -115,11 +115,15 @@ export async function add(args: string[]): Promise<void> {
     printWarn(`Warning: Could not check for conflicts: ${message(err)}`);
   }
 
-  if (!isUpdate) {
-    const inHosts = await hosts.hasDomain(hosts.getHostsPath(), domain).catch(() => false);
-    if (inHosts) {
-      printWarn(`Warning: Domain '${domain}' already exists in /etc/hosts (will be updated)`);
-    }
+  // A pre-existing entry OUTSIDE hostler's managed block isn't ours to rewrite,
+  // and it could shadow the one we add — fail rather than report a false success.
+  const unmanaged = await hosts
+    .hasUnmanagedDomain(hosts.getHostsPath(), domain)
+    .catch(() => false);
+  if (unmanaged) {
+    printError(`'${domain}' already has an entry in /etc/hosts outside hostler's managed block`);
+    printWarn("  Remove that line first — it would shadow the entry hostler manages.");
+    process.exit(1);
   }
 
   printOk("  No conflicts found");

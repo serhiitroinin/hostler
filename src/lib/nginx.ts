@@ -109,6 +109,11 @@ export function untrustedBinaryReason(path: string): string | null {
   return checkTrustedPath(path, "file", 0);
 }
 
+/** Trust check for a regular file (e.g. nginx.conf or an included config file). */
+export function untrustedFileReason(path: string): string | null {
+  return checkTrustedPath(path, "file", 0);
+}
+
 /**
  * Same component-by-component trust check as untrustedBinaryReason, but for a
  * directory we're about to include into root nginx. A pre-existing
@@ -159,6 +164,31 @@ function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): st
   if (leaf === "file" && !finalSt.isFile()) return `${path} is not a regular file`;
   if (leaf === "dir" && !finalSt.isDirectory()) return `${path} is not a directory`;
   return null;
+}
+
+/**
+ * Collects the absolute filesystem targets referenced by `include` directives in
+ * nginx.conf — for a glob like `servers/*.conf` the containing directory, for a
+ * literal path the path itself. Used to trust-check the tree that a passwordless
+ * `nginx -s reload` would load. One level deep (does not recurse into included
+ * files); the directories it returns are themselves validated, so anything they
+ * contain is root-managed.
+ */
+export async function collectIncludeTargets(mainConfigPath: string): Promise<string[]> {
+  const content = await readFile(mainConfigPath, "utf8").catch(() => "");
+  const baseDir = dirname(mainConfigPath);
+  const targets = new Set<string>();
+
+  const re = /^\s*include\s+([^;]+);/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    let inc = m[1]!.trim().replace(/^["']|["']$/g, "");
+    if (!isAbsolute(inc)) inc = resolve(baseDir, inc);
+    // A glob in the final component means "every file in this directory".
+    if (/[*?[\]]/.test(basename(inc))) inc = dirname(inc);
+    targets.add(inc);
+  }
+  return [...targets];
 }
 
 /**

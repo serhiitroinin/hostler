@@ -215,17 +215,25 @@ privileged helper re-validates its arguments, so the wildcard sudoers rules
 can't be abused for arbitrary commands. `init` must be run from the compiled
 binary (not `bun run`), so the sudoers rule references a stable path.
 
-**`init` fails closed on untrusted binaries.** Because a NOPASSWD rule pointing
-at a binary you can overwrite is equivalent to passwordless root, `init` aborts
-if the `hostler` or `nginx` binary isn't root-owned and non-writable by others.
-Install them to a root-owned path first:
+**`init` fails closed on an untrusted environment.** A NOPASSWD rule is only as
+safe as the things it points at, so `init` aborts if either:
+
+- the `hostler` or `nginx` **binary** isn't root-owned and non-writable, or
+- the **nginx config tree** that `nginx -s reload` loads (nginx.conf and every
+  directory/file it `include`s) is writable by a non-root user.
+
+(every path component is checked, symlinks are followed). Install to root-owned
+paths first:
 
 ```bash
 sudo install -o root -m 0755 ./hostler /usr/local/bin/hostler
 ```
 
-On Homebrew (whose prefix is user-owned) you can accept the risk explicitly with
-`sudo hostler init --allow-untrusted-binaries`.
+On Homebrew — whose prefix (`/opt/homebrew`) is user-owned, so both the binaries
+and the nginx config tree are user-writable — accept the risk explicitly with
+`sudo hostler init --allow-untrusted` (the old `--allow-untrusted-binaries` is a
+deprecated alias). This flag does **not** bypass a leftover legacy include or an
+unsafe `/etc/hostler` config dir — those always fail closed.
 
 > **Upgrading from an older install?** Re-run `sudo hostler init` once. It moves
 > the config directory to `/etc/hostler/<user>/` (root-owned), migrates your

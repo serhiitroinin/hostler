@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { insertIntoHttpBlock } from "../src/lib/nginx.ts";
+import { collectIncludeTargets, insertIntoHttpBlock } from "../src/lib/nginx.ts";
 import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 describe("insertIntoHttpBlock", () => {
   test("inserts before the http block's closing brace, not the file end", () => {
@@ -55,6 +58,28 @@ describe("buildSudoers", () => {
   test("does not grant a blanket nginx or shell rule", () => {
     expect(sudoers).not.toMatch(/NOPASSWD:\s*\/opt\/homebrew\/bin\/nginx\s*$/m);
     expect(sudoers).not.toContain("ALL\n");
+  });
+});
+
+describe("collectIncludeTargets", () => {
+  test("resolves glob includes to their directory and literals to the path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const conf = join(dir, "nginx.conf");
+    writeFileSync(
+      conf,
+      [
+        "http {",
+        "    include /etc/nginx/conf.d/*.conf;", // glob → dir
+        "    include servers/*;", // relative glob → dir under conf dir
+        "    include /etc/nginx/mime.types;", // literal file
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const targets = await collectIncludeTargets(conf);
+    expect(targets).toContain("/etc/nginx/conf.d");
+    expect(targets).toContain(join(dir, "servers"));
+    expect(targets).toContain("/etc/nginx/mime.types");
   });
 });
 
