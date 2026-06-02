@@ -1,7 +1,7 @@
 // `sudo hostler init` — one-time privileged setup that enables passwordless
 // daily use: create the root-owned config dir under /etc, add the nginx
 // include, and install a minimal per-user sudoers rule.
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { writeFile, mkdir, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -234,16 +234,10 @@ async function assertTrustedReloadTree(mainConfigPath: string, allowUntrusted: b
   const mainReason = nginx.untrustedFileReason(mainConfigPath);
   if (mainReason) problems.push(`nginx config ${mainConfigPath}: ${mainReason}`);
 
+  // collectIncludeTargets recurses through included files; untrustedReloadTarget
+  // Reason validates each, including missing-but-creatable glob dirs.
   for (const target of await nginx.collectIncludeTargets(mainConfigPath)) {
-    let st;
-    try {
-      st = lstatSync(target);
-    } catch {
-      continue; // referenced path doesn't exist — nothing to load
-    }
-    const reason = st.isDirectory()
-      ? nginx.untrustedConfigDirReason(target)
-      : nginx.untrustedFileReason(target);
+    const reason = nginx.untrustedReloadTargetReason(target);
     if (reason) problems.push(`include ${target}: ${reason}`);
   }
 
