@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+  addIncludeDirective,
   collectIncludeTargets,
+  hasIncludeDirective,
   insertIntoHttpBlock,
   scanIncludeArgs,
   untrustedReloadTargetReason,
 } from "../src/lib/nginx.ts";
 import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -176,6 +178,26 @@ describe("scanIncludeArgs", () => {
 
   test("handles multiple directives on one line", () => {
     expect(scanIncludeArgs("include /x.conf; include /y.conf;")).toEqual(["/x.conf", "/y.conf"]);
+  });
+});
+
+describe("hasIncludeDirective / addIncludeDirective", () => {
+  test("a commented-out include is not treated as active and the real one is inserted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-inc-"));
+    const conf = join(dir, "nginx.conf");
+    const userDir = "/etc/hostler/alice";
+    // Only a commented include is present — nginx would NOT load these configs.
+    writeFileSync(conf, `http {\n    # include ${userDir}/*.conf;\n}\n`);
+
+    expect(await hasIncludeDirective(conf, userDir)).toBe(false);
+    expect(await addIncludeDirective(conf, userDir)).toBe(true); // really inserts it
+    expect(await hasIncludeDirective(conf, userDir)).toBe(true);
+    expect(await addIncludeDirective(conf, userDir)).toBe(false); // now idempotent
+
+    const out = readFileSync(conf, "utf8");
+    // The active directive exists in addition to the original comment.
+    expect(scanIncludeArgs(out)).toContain(`${userDir}/*.conf`);
+    expect(out).toContain(`# include ${userDir}/*.conf;`);
   });
 });
 
