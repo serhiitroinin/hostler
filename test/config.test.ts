@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { getUserConfigDir, SYSTEM_CONFIG_BASE } from "../src/lib/config.ts";
 import { untrustedBinaryReason } from "../src/lib/nginx.ts";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,15 +19,30 @@ describe("getUserConfigDir", () => {
 });
 
 describe("untrustedBinaryReason", () => {
-  test("flags a non-root-owned binary (sudoers reference would be unsafe)", () => {
+  test("flags a binary in a user-owned directory (replaceable → unsafe)", () => {
     const dir = mkdtempSync(join(tmpdir(), "hostler-bin-"));
     const bin = join(dir, "nginx");
     writeFileSync(bin, "#!/bin/sh\n", { mode: 0o755 });
-    // Test runs unprivileged, so the file is owned by the test user, not root.
-    expect(untrustedBinaryReason(bin)).toBe("not owned by root");
+    // Test runs unprivileged, so a path component is owned by the test user.
+    expect(untrustedBinaryReason(bin)).toMatch(/not owned by root/);
   });
 
-  test("reports a missing binary", () => {
-    expect(untrustedBinaryReason("/nonexistent/nginx")).toBe("not found");
+  test("reports a missing path", () => {
+    expect(untrustedBinaryReason("/nonexistent/hostler-x/nginx")).toMatch(/not found/);
+  });
+
+  test("rejects a relative path", () => {
+    expect(untrustedBinaryReason("relative/nginx")).toMatch(/not an absolute path/);
+  });
+
+  test("accepts a fully root-owned system path", () => {
+    // /usr and below are root-owned and not group/world-writable on a sane box.
+    // Use a binary that exists in CI/dev; skip cleanly if absent.
+    for (const p of ["/bin/sh", "/usr/bin/true"]) {
+      if (existsSync(p)) {
+        expect(untrustedBinaryReason(p)).toBeNull();
+        return;
+      }
+    }
   });
 });
