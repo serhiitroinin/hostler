@@ -106,10 +106,21 @@ export async function resolveNginxBin(): Promise<string> {
  * than silently trusting it.)
  */
 export function untrustedBinaryReason(path: string): string | null {
-  return checkTrustedPath(path, 0);
+  return checkTrustedPath(path, "file", 0);
 }
 
-function checkTrustedPath(path: string, depth: number): string | null {
+/**
+ * Same component-by-component trust check as untrustedBinaryReason, but for a
+ * directory we're about to include into root nginx. A pre-existing
+ * /etc/hostler or /etc/hostler/<user> that is symlinked, user-owned, or
+ * group/world-writable would let an unprivileged process feed configs to root
+ * nginx — so verify it before adding the include.
+ */
+export function untrustedConfigDirReason(path: string): string | null {
+  return checkTrustedPath(path, "dir", 0);
+}
+
+function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): string | null {
   if (depth > 16) return "too many symlink levels";
   if (!isAbsolute(path)) return `not an absolute path: ${path}`;
 
@@ -132,7 +143,7 @@ function checkTrustedPath(path: string, depth: number): string | null {
       const target = readlinkSync(current);
       const resolved = isAbsolute(target) ? target : resolve(dirname(current), target);
       const rest = parts.slice(i + 1).join("/");
-      return checkTrustedPath(rest ? `${resolved}/${rest}` : resolved, depth + 1);
+      return checkTrustedPath(rest ? `${resolved}/${rest}` : resolved, leaf, depth + 1);
     }
 
     if (st.mode & 0o022) {
@@ -144,7 +155,41 @@ function checkTrustedPath(path: string, depth: number): string | null {
     }
   }
 
-  if (!lstatSync(path).isFile()) return `${path} is not a regular file`;
+  const finalSt = lstatSync(path);
+  if (leaf === "file" && !finalSt.isFile()) return `${path} is not a regular file`;
+  if (leaf === "dir" && !finalSt.isDirectory()) return `${path} is not a directory`;
+  return null;
+}
+
+/**
+ * Scans every other user's /etc/hostler/<user>/ dir for `domain`, so a
+ * multi-user machine surfaces a cross-user collision before nginx silently
+ * ignores the duplicate. Returns the conflicting dir, or null.
+ */
+export async function findDomainInOtherUserDirs(
+  domain: string,
+  selfConfigDir: string,
+): Promise<string | null> {
+  const base = dirname(selfConfigDir); // /etc/hostler
+  let names: string[];
+  try {
+    names = await readdir(base);
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    const dir = join(base, name);
+    if (dir === selfConfigDir) continue;
+    let isDir = false;
+    try {
+      isDir = lstatSync(dir).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+    const entries = await parseUserConfigs(dir);
+    if (entries.some((e) => e.domain === domain)) return dir;
+  }
   return null;
 }
 

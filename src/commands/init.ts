@@ -102,12 +102,24 @@ export async function init(args: string[] = []): Promise<void> {
     printError(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
+
+  // mkdir won't repair a pre-existing unsafe dir (symlinked, user-owned, or
+  // group/world-writable). Verify it before we ever include it into root nginx.
+  // Always fail closed here: unlike a Homebrew binary, there is no legitimate
+  // reason for /etc/hostler to be user-writable.
+  const dirReason = nginx.untrustedConfigDirReason(configDir);
+  if (dirReason) {
+    printError(`config directory is unsafe: ${dirReason}`);
+    console.log("Remove or fix it (it must be a root-owned directory under /etc/hostler), then retry.");
+    process.exit(1);
+  }
   printOk(`  Created: ${configDir} (root-owned)`);
 
   // Step 2b: migrate from a previous-version dir (~/.hostler/nginx) and, crucially,
-  // remove its include + the old user-writable directory so the upgrade doesn't
-  // keep including an unsafe path.
-  await migrateOldInstall(username, configDir, cfg.mainConfigPath);
+  // remove its include so the upgrade doesn't keep including an unsafe path. This
+  // runs even when the old dir is gone (a stale include can outlive it) and fails
+  // closed if the include can't be fully removed.
+  await migrateOldInstall(username, configDir, cfg.mainConfigPath, allowUntrusted);
 
   // Step 3: add the include directive to nginx.conf.
   console.log();
@@ -197,41 +209,60 @@ async function assertTrustedBinaries(nginxPath: string, allowUntrusted: boolean)
 }
 
 /**
- * Regenerates domains from a previous-version ~/.hostler/nginx dir, then removes
- * that dir's include from nginx.conf and deletes the dir. Without the include
- * removal an upgraded install would keep including a user-writable directory.
+ * Migrates a previous-version ~/.hostler/nginx install and, crucially, removes
+ * its include from nginx.conf. The include removal runs even when the old dir is
+ * already gone — a stale `include ~/.hostler/nginx/*.conf;` line can outlive the
+ * directory, and a user could later recreate the home-owned dir and trigger a
+ * passwordless reload. Fails closed if the include can't be fully removed.
  */
-async function migrateOldInstall(username: string, configDir: string, mainConfigPath: string): Promise<void> {
+async function migrateOldInstall(
+  username: string,
+  configDir: string,
+  mainConfigPath: string,
+  allowUntrusted: boolean,
+): Promise<void> {
   const home = await resolveUserHome(username);
-  if (!home) return;
-  const oldDir = join(home, ".hostler", "nginx");
-  if (!existsSync(oldDir)) return;
-
-  let migrated = 0;
-  for (const entry of await nginx.parseUserConfigs(oldDir)) {
-    const domain = normalizeDomain(entry.domain);
-    if (entry.port !== null && isValidDomain(domain)) {
-      await nginx.writeUserDomainConfig(configDir, domain, entry.port);
-      migrated++;
-    }
+  if (!home) {
+    printWarn("  Could not resolve home dir; skipping legacy include cleanup.");
+    return;
   }
-  if (migrated > 0) printOk(`  Migrated ${migrated} domain(s) from ${oldDir}`);
+  const oldDir = join(home, ".hostler", "nginx");
+  const oldDirExists = existsSync(oldDir);
 
-  // Neutralize the old include (the security-critical part). Match by path, not
-  // by exact generated form, and verify it's actually gone before claiming so.
+  // Migrate domains (regenerated from template) only if the old dir is present.
+  if (oldDirExists) {
+    let migrated = 0;
+    for (const entry of await nginx.parseUserConfigs(oldDir)) {
+      const domain = normalizeDomain(entry.domain);
+      if (entry.port !== null && isValidDomain(domain)) {
+        await nginx.writeUserDomainConfig(configDir, domain, entry.port);
+        migrated++;
+      }
+    }
+    if (migrated > 0) printOk(`  Migrated ${migrated} domain(s) from ${oldDir}`);
+  }
+
+  // ALWAYS neutralize any legacy include for the old path, present dir or not.
   const { removed, stillPresent } = await nginx.removeIncludeByPath(mainConfigPath, oldDir);
+  if (stillPresent && !allowUntrusted) {
+    printError(`a legacy include referencing ${oldDir} remains in ${mainConfigPath}.`);
+    console.log("nginx would keep including a user-writable directory. Remove that include line");
+    console.log(`manually, or re-run with ${ALLOW_UNTRUSTED_FLAG} to proceed anyway.`);
+    process.exit(1);
+  }
   if (stillPresent) {
-    printWarn(`  Warning: an include referencing ${oldDir} remains in ${mainConfigPath}.`);
-    printWarn("           Remove it manually — nginx is still including a user-writable directory.");
+    printWarn(`  Proceeding despite a remaining include for ${oldDir} (--allow-untrusted-binaries).`);
   } else if (removed) {
     printOk(`  Removed legacy include for ${oldDir}`);
   }
 
   // Delete only the old nginx config dir (not the whole ~/.hostler, which may
   // hold unrelated data), then drop ~/.hostler if it's now empty.
-  await rm(oldDir, { recursive: true, force: true });
-  await rmdir(join(home, ".hostler")).catch(() => {});
-  printOk(`  Removed ${oldDir}`);
+  if (oldDirExists) {
+    await rm(oldDir, { recursive: true, force: true });
+    await rmdir(join(home, ".hostler")).catch(() => {});
+    printOk(`  Removed ${oldDir}`);
+  }
 }
 
 async function createSudoersFile(username: string, sudoersPath: string): Promise<void> {

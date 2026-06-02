@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { getUserConfigDir, SYSTEM_CONFIG_BASE } from "../src/lib/config.ts";
-import { untrustedBinaryReason } from "../src/lib/nginx.ts";
+import { untrustedBinaryReason, untrustedConfigDirReason } from "../src/lib/nginx.ts";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,25 @@ describe("getUserConfigDir", () => {
     expect(() => getUserConfigDir("../etc")).toThrow();
     expect(() => getUserConfigDir("a/b")).toThrow();
     expect(() => getUserConfigDir("")).toThrow();
+  });
+
+  test("rejects bare dot and dot-dot (path traversal)", () => {
+    // "." would resolve to /etc/hostler and ".." to /etc.
+    expect(() => getUserConfigDir(".")).toThrow();
+    expect(() => getUserConfigDir("..")).toThrow();
+  });
+});
+
+describe("untrustedConfigDirReason", () => {
+  test("flags a user-owned directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-cfg-"));
+    expect(untrustedConfigDirReason(dir)).toMatch(/not owned by root/);
+  });
+
+  test("rejects a file where a directory is expected", () => {
+    if (existsSync("/etc/hosts")) {
+      expect(untrustedConfigDirReason("/etc/hosts")).toMatch(/not a directory/);
+    }
   });
 });
 
