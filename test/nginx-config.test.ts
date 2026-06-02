@@ -81,6 +81,20 @@ describe("collectIncludeTargets", () => {
     expect(targets).toContain(join(dir, "servers"));
     expect(targets).toContain("/etc/nginx/mime.types");
   });
+
+  test("recurses through included files and survives cycles", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const main = join(dir, "nginx.conf");
+    writeFileSync(main, "include sub.conf;\ninclude self.conf;\n");
+    // A nested include inside an included FILE must still be discovered.
+    writeFileSync(join(dir, "sub.conf"), "include /Users/alice/nginx/*.conf;\n");
+    // Self-referential include must not hang.
+    writeFileSync(join(dir, "self.conf"), "include self.conf;\n");
+
+    const targets = await collectIncludeTargets(main);
+    expect(targets).toContain(join(dir, "sub.conf"));
+    expect(targets).toContain("/Users/alice/nginx"); // found only via recursion into sub.conf
+  });
 });
 
 describe("sudoersPathFor", () => {
