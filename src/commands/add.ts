@@ -89,6 +89,19 @@ export async function add(args: string[]): Promise<void> {
     printWarn(`Warning: port ${port} is also used by '${portTwin.domain}'`);
   }
 
+  // Another user's hostler configs live under a sibling /etc/hostler/<user>/ dir;
+  // nginx would only warn ("conflicting server name") and silently ignore the
+  // duplicate, so catch it here as a hard error.
+  if (!isUpdate) {
+    const otherUserDir = await nginx
+      .findDomainInOtherUserDirs(domain, configDir)
+      .catch(() => null);
+    if (otherUserDir) {
+      printError(`Domain '${domain}' is already configured by another user in: ${otherUserDir}`);
+      process.exit(1);
+    }
+  }
+
   try {
     const { domainConflict, portConflict } = await nginx.findConflicts(cfg.includeDir, domain, port);
     if (domainConflict) {
@@ -145,11 +158,17 @@ export async function add(args: string[]): Promise<void> {
   }
   if (!isUpdate) printOk("  Updated /etc/hosts (via sudo)");
 
-  // 3. Validate.
+  // 3. Validate. `nginx -t` exits 0 even when it merely *warns* about a
+  // conflicting server name (a duplicate from any source — another user, a stale
+  // config). Treat such a warning for our domain as a hard failure, since nginx
+  // would otherwise silently ignore one of the duplicates.
   const nginxBin = await nginx.resolveNginxBin();
   const test = await run(["sudo", nginxBin, "-t"]);
-  if (!test.ok) {
-    printError("nginx config test failed");
+  const conflictsOurDomain = new RegExp(
+    `conflicting server name "${escapeRegExp(domain)}"`,
+  ).test(test.combined);
+  if (!test.ok || conflictsOurDomain) {
+    printError(conflictsOurDomain ? `Domain '${domain}' conflicts with an existing server block` : "nginx config test failed");
     console.log(test.combined.trim());
     printWarn("  Rolling back changes...");
     await rollback();
@@ -179,4 +198,8 @@ export async function add(args: string[]): Promise<void> {
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
