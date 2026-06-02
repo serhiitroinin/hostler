@@ -1,6 +1,6 @@
 // nginx detection, config generation/parsing, include-directive management, and
 // process control.
-import { existsSync, lstatSync, readlinkSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { run } from "./exec.ts";
@@ -167,28 +167,116 @@ function checkTrustedPath(path: string, leaf: "file" | "dir", depth: number): st
 }
 
 /**
- * Collects the absolute filesystem targets referenced by `include` directives in
- * nginx.conf — for a glob like `servers/*.conf` the containing directory, for a
- * literal path the path itself. Used to trust-check the tree that a passwordless
- * `nginx -s reload` would load. One level deep (does not recurse into included
- * files); the directories it returns are themselves validated, so anything they
- * contain is root-managed.
+ * Collects the absolute filesystem targets referenced by `include` directives,
+ * recursively — for a glob like `servers/*.conf` the containing directory, for a
+ * literal path the path itself. Used to trust-check the entire tree a
+ * passwordless `nginx -s reload` would load.
+ *
+ * Recursion follows included FILES (so an `include` buried inside an included
+ * file is still validated), bounded by `maxDepth` and a visited-set for cycle
+ * protection. Glob includes also enumerate their currently-matching files to
+ * follow nested includes; the directory itself is returned as a target so it's
+ * trust-checked regardless.
  */
-export async function collectIncludeTargets(mainConfigPath: string): Promise<string[]> {
-  const content = await readFile(mainConfigPath, "utf8").catch(() => "");
-  const baseDir = dirname(mainConfigPath);
+export async function collectIncludeTargets(mainConfigPath: string, maxDepth = 32): Promise<string[]> {
   const targets = new Set<string>();
+  const visited = new Set<string>();
+  const queue: Array<{ file: string; depth: number }> = [{ file: mainConfigPath, depth: 0 }];
 
-  const re = /^\s*include\s+([^;]+);/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    let inc = m[1]!.trim().replace(/^["']|["']$/g, "");
-    if (!isAbsolute(inc)) inc = resolve(baseDir, inc);
-    // A glob in the final component means "every file in this directory".
-    if (/[*?[\]]/.test(basename(inc))) inc = dirname(inc);
-    targets.add(inc);
+  while (queue.length > 0) {
+    const { file, depth } = queue.shift()!;
+    if (depth > maxDepth) continue;
+    const real = realpathSafe(file);
+    if (visited.has(real)) continue;
+    visited.add(real);
+
+    let content: string;
+    try {
+      content = await readFile(file, "utf8");
+    } catch {
+      continue;
+    }
+    const baseDir = dirname(file);
+
+    const re = /^\s*include\s+([^;]+);/gm;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(content)) !== null) {
+      let inc = m[1]!.trim().replace(/^["']|["']$/g, "");
+      if (!isAbsolute(inc)) inc = resolve(baseDir, inc);
+
+      if (/[*?[\]]/.test(basename(inc))) {
+        const dir = dirname(inc);
+        targets.add(dir);
+        for (const f of globFiles(dir, basename(inc))) queue.push({ file: f, depth: depth + 1 });
+      } else {
+        targets.add(inc);
+        let st: ReturnType<typeof lstatSync> | null = null;
+        try {
+          st = lstatSync(inc);
+        } catch {
+          st = null;
+        }
+        if (st?.isFile()) queue.push({ file: inc, depth: depth + 1 });
+      }
+    }
   }
   return [...targets];
+}
+
+function realpathSafe(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+// Lists absolute paths of files in `dir` matching a simple nginx glob (* and ?).
+function globFiles(dir: string, pattern: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const re = new RegExp(
+    `^${pattern.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`,
+  );
+  return names.filter((n) => re.test(n)).map((n) => join(dir, n));
+}
+
+/**
+ * Trust reason for a path that a reload would load, accounting for non-existence.
+ * If the target is missing, the nearest existing ancestor must be trusted —
+ * otherwise an unprivileged user could create the missing path (e.g. an absent
+ * `/Users/alice/nginx` glob dir) and load arbitrary config via passwordless
+ * reload. Returns null when safe.
+ */
+export function untrustedReloadTargetReason(target: string): string | null {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(target);
+  } catch {
+    const ancestor = nearestExistingAncestor(target);
+    if (!ancestor) return null;
+    const reason = checkTrustedPath(ancestor, "dir", 0);
+    return reason ? `${target} is missing and could be created — ${reason}` : null;
+  }
+  return st.isDirectory() ? untrustedConfigDirReason(target) : untrustedFileReason(target);
+}
+
+function nearestExistingAncestor(path: string): string | null {
+  let cur = dirname(path);
+  for (;;) {
+    try {
+      lstatSync(cur);
+      return cur;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return null;
+      cur = parent;
+    }
+  }
 }
 
 /**
