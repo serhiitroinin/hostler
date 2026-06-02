@@ -66,6 +66,12 @@ test("hasUnmanagedDomain only flags entries outside the managed block", async ()
   expect(await hasUnmanagedDomain(hostsPath, "commented.loc")).toBe(false);
 });
 
+test("hasUnmanagedDomain is case-insensitive", async () => {
+  // Hostnames are case-insensitive; a manual App.loc must flag for app.loc.
+  await writeFile(hostsPath, "127.0.0.1\tApp.loc\n");
+  expect(await hasUnmanagedDomain(hostsPath, "app.loc")).toBe(true);
+});
+
 test("hasDomain matches whole fields, not substrings", async () => {
   await addEntry(hostsPath, "app.loc");
   expect(await hasDomain(hostsPath, "app.loc")).toBe(true);

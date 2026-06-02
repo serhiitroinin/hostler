@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { getUserConfigDir, SYSTEM_CONFIG_BASE } from "../src/lib/config.ts";
-import { untrustedBinaryReason, untrustedConfigDirReason } from "../src/lib/nginx.ts";
+import {
+  untrustedBinaryReason,
+  untrustedConfigDirReason,
+  untrustedReloadTargetReason,
+} from "../src/lib/nginx.ts";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +37,23 @@ describe("untrustedConfigDirReason", () => {
   test("rejects a file where a directory is expected", () => {
     if (existsSync("/etc/hosts")) {
       expect(untrustedConfigDirReason("/etc/hosts")).toMatch(/not a directory/);
+    }
+  });
+});
+
+describe("untrustedReloadTargetReason", () => {
+  test("flags a missing target whose nearest existing parent is user-owned", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-rt-"));
+    // The glob dir doesn't exist yet, but the user owns the parent and could
+    // create it, then drop configs that root would reload.
+    const missing = join(dir, "newsub", "*.conf");
+    expect(untrustedReloadTargetReason(missing)).toMatch(/missing and could be created/);
+  });
+
+  test("allows a missing target under a root-owned, unwritable parent", () => {
+    // A user can't create a child under /usr, so a missing include there is safe.
+    if (existsSync("/usr")) {
+      expect(untrustedReloadTargetReason("/usr/hostler-nonexistent-xyz/x.conf")).toBeNull();
     }
   });
 });
