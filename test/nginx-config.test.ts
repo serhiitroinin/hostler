@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { collectIncludeTargets, insertIntoHttpBlock } from "../src/lib/nginx.ts";
+import {
+  collectIncludeTargets,
+  insertIntoHttpBlock,
+  untrustedReloadTargetReason,
+} from "../src/lib/nginx.ts";
 import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -97,6 +101,18 @@ describe("collectIncludeTargets", () => {
     expect(targets).toContain(confd);
     expect(targets).toContain(join(confd, "app.conf"));
     expect(targets).toContain(join(confd, "api.conf"));
+  });
+
+  test("fails closed when the include chain exceeds the depth limit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const main = join(dir, "nginx.conf");
+    writeFileSync(main, "include a.conf;\n");
+    writeFileSync(join(dir, "a.conf"), "include b.conf;\n");
+    writeFileSync(join(dir, "b.conf"), "# leaf\n");
+
+    const targets = await collectIncludeTargets(main, 1); // maxDepth = 1
+    const reasons = targets.map((t) => untrustedReloadTargetReason(t));
+    expect(reasons.some((r) => r?.includes("include depth limit exceeded"))).toBe(true);
   });
 
   test("keeps a pre-basename wildcard as a target so it fails closed", async () => {
