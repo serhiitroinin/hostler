@@ -80,11 +80,12 @@ Output:
 ```
 hostler init
 ─────────────────────────────────────
+Verifying binaries...
 Detecting nginx...
   nginx version: 1.25.3
   nginx config: /opt/homebrew/etc/nginx/nginx.conf
 
-Creating user configuration directory...
+Creating configuration directory...
   Created: /etc/hostler/you (root-owned)
 
 Adding include directive to nginx.conf...
@@ -94,7 +95,7 @@ Testing nginx configuration...
   nginx config is valid
 
 Setting up passwordless sudo...
-  Created: /etc/sudoers.d/hostler
+  Created: /etc/sudoers.d/hostler-501
 
 Successfully initialized hostler!
 ```
@@ -202,8 +203,9 @@ Entries are added to `/etc/hosts` in a managed block:
 
 ### Sudoers configuration
 
-The `init` command creates a **per-user** file `/etc/sudoers.d/hostler-<user>`
-(so multiple users on one machine don't clobber each other) with rules that allow:
+The `init` command creates a **per-user** file `/etc/sudoers.d/hostler-<uid>`
+(keyed on your numeric UID so multiple users on one machine don't clobber each
+other) with rules that allow:
 - Adding/removing entries from `/etc/hosts` (`_hosts-add` / `_hosts-remove`)
 - Writing per-domain nginx configs (`_nginx-add` / `_nginx-remove`)
 - Running `nginx -t` and `nginx -s reload`

@@ -59,13 +59,16 @@ describe("buildSudoers", () => {
 });
 
 describe("sudoersPathFor", () => {
-  test("is per-user and dot-free (sudo ignores dotted filenames)", () => {
-    expect(sudoersPathFor("alice")).toBe("/etc/sudoers.d/hostler-alice");
-    expect(sudoersPathFor("first.last")).toBe("/etc/sudoers.d/hostler-first_last");
-    expect(sudoersPathFor("a b")).toBe("/etc/sudoers.d/hostler-a_b");
+  test("is keyed on UID — unique, dot-free, no collisions", () => {
+    expect(sudoersPathFor(501)).toBe("/etc/sudoers.d/hostler-501");
+    expect(sudoersPathFor(0)).toBe("/etc/sudoers.d/hostler-0");
+    // Distinct UIDs never collide (unlike sanitized usernames first.last/first_last).
+    expect(sudoersPathFor(501)).not.toBe(sudoersPathFor(1001));
   });
 
-  test("distinct users get distinct files (no clobber)", () => {
-    expect(sudoersPathFor("alice")).not.toBe(sudoersPathFor("bob"));
+  test("rejects invalid uids", () => {
+    expect(() => sudoersPathFor(-1)).toThrow();
+    expect(() => sudoersPathFor(1.5)).toThrow();
+    expect(() => sudoersPathFor(Number.NaN)).toThrow();
   });
 });
