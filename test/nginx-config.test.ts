@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   collectIncludeTargets,
   insertIntoHttpBlock,
+  scanIncludeArgs,
   untrustedReloadTargetReason,
 } from "../src/lib/nginx.ts";
 import { buildSudoers, sudoersPathFor } from "../src/commands/init.ts";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -123,6 +124,28 @@ describe("collectIncludeTargets", () => {
     expect(targets.some((t) => t.includes("*"))).toBe(true);
   });
 
+  test("finds an inline include (not anchored to line start)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const main = join(dir, "nginx.conf");
+    writeFileSync(main, "http { include /Users/alice/nginx/*.conf; }\n");
+    const targets = await collectIncludeTargets(main);
+    expect(targets).toContain("/Users/alice/nginx");
+  });
+
+  test("recurses into a symlinked included config file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
+    const main = join(dir, "nginx.conf");
+    const real = join(dir, "real.conf");
+    const link = join(dir, "link.conf");
+    writeFileSync(real, "include /Users/alice/nginx/*.conf;\n");
+    symlinkSync(real, link); // sites-enabled style symlink
+    writeFileSync(main, `include ${link};\n`);
+
+    const targets = await collectIncludeTargets(main);
+    // Only discoverable by following the symlink and reading real.conf.
+    expect(targets).toContain("/Users/alice/nginx");
+  });
+
   test("recurses through included files and survives cycles", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hostler-conf-"));
     const main = join(dir, "nginx.conf");
@@ -135,6 +158,24 @@ describe("collectIncludeTargets", () => {
     const targets = await collectIncludeTargets(main);
     expect(targets).toContain(join(dir, "sub.conf"));
     expect(targets).toContain("/Users/alice/nginx"); // found only via recursion into sub.conf
+  });
+});
+
+describe("scanIncludeArgs", () => {
+  test("finds inline includes and ignores comments and quotes", () => {
+    const args = scanIncludeArgs(
+      [
+        "http { include /a/*.conf; }",
+        "# include /commented/*.conf;",
+        'include "/b/c.conf";',
+        "server { listen 80; }", // not an include
+      ].join("\n"),
+    );
+    expect(args).toEqual(["/a/*.conf", "/b/c.conf"]);
+  });
+
+  test("handles multiple directives on one line", () => {
+    expect(scanIncludeArgs("include /x.conf; include /y.conf;")).toEqual(["/x.conf", "/y.conf"]);
   });
 });
 
